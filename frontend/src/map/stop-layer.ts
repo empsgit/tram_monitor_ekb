@@ -24,11 +24,11 @@ export class StopLayer {
     for (const stop of stops) {
       const marker = L.circleMarker([stop.lat, stop.lon], {
         pane: STOP_PANE,
-        radius: 6,
+        radius: 4,
         fillColor: "#60a5fa",
         fillOpacity: 0.9,
         color: "white",
-        weight: 1.5,
+        weight: 1.2,
       });
 
       const label = stop.direction
@@ -71,7 +71,7 @@ export class StopLayer {
     const selected = this.markers.get(stopId);
     if (selected) {
       selected.setStyle({
-        radius: 10,
+        radius: 6,
         fillColor: "#e94560",
         fillOpacity: 1,
         weight: 3,
