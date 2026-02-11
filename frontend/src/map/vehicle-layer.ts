@@ -1,6 +1,7 @@
-/** Manages tram vehicle markers on the map. */
+/** Manages tram vehicle markers on the map with smooth animation. */
 
 import L from "leaflet";
+import "leaflet.marker.slideto";
 import type { VehicleData } from "../services/ws-client";
 
 // Route colors (deterministic from route number)
@@ -19,23 +20,34 @@ function routeColor(routeNum: string): string {
   return COLORS[Math.abs(hash) % COLORS.length];
 }
 
-function createIcon(routeNum: string, course: number): L.DivIcon {
+export { routeColor };
+
+function createIcon(routeNum: string): L.DivIcon {
   const color = routeColor(routeNum);
   return L.divIcon({
     className: "",
     iconSize: [32, 32],
     iconAnchor: [16, 16],
     html: `
-      <div class="tram-marker" style="background:${color};transform:rotate(${course}deg)">
-        <span class="arrow"></span>
-        <span style="transform:rotate(-${course}deg)">${routeNum}</span>
+      <div class="tram-marker" style="background:${color}">
+        <span class="tram-arrow"></span>
+        <span class="tram-label">${routeNum}</span>
       </div>
     `,
   });
 }
 
+// Track per-marker metadata to avoid unnecessary DOM updates
+interface MarkerMeta {
+  route: string;
+  course: number;
+}
+
+const SLIDE_DURATION = 9500; // slightly under 10s poll interval for smooth overlap
+
 export class VehicleLayer {
   private markers: Map<string, L.Marker> = new Map();
+  private meta: Map<string, MarkerMeta> = new Map();
   private layerGroup: L.LayerGroup;
 
   constructor(map: L.Map) {
@@ -54,22 +66,35 @@ export class VehicleLayer {
         const marker = existing as any;
         if (typeof marker.slideTo === "function") {
           marker.slideTo([v.lat, v.lon], {
-            duration: 9000,
+            duration: SLIDE_DURATION,
             keepAtCenter: false,
           });
         } else {
           existing.setLatLng([v.lat, v.lon]);
         }
-        existing.setIcon(createIcon(v.route, v.course));
-        existing.unbindPopup();
-        existing.bindPopup(this.popupHtml(v));
+
+        // Only recreate icon if route changed (very rare)
+        const prev = this.meta.get(v.id);
+        if (!prev || prev.route !== v.route) {
+          existing.setIcon(createIcon(v.route));
+        }
+
+        // Update heading via DOM to avoid icon recreation
+        this.updateHeading(existing, v.course);
+        this.meta.set(v.id, { route: v.route, course: v.course });
+
+        // Update popup content without rebinding (keeps popup open if it is)
+        existing.setPopupContent(this.popupHtml(v));
       } else {
         const marker = L.marker([v.lat, v.lon], {
-          icon: createIcon(v.route, v.course),
+          icon: createIcon(v.route),
         });
         marker.bindPopup(this.popupHtml(v));
         marker.addTo(this.layerGroup);
         this.markers.set(v.id, marker);
+        this.meta.set(v.id, { route: v.route, course: v.course });
+        // Set initial heading
+        this.updateHeading(marker, v.course);
       }
     }
 
@@ -78,7 +103,21 @@ export class VehicleLayer {
       if (!seen.has(id)) {
         this.layerGroup.removeLayer(marker);
         this.markers.delete(id);
+        this.meta.delete(id);
       }
+    }
+  }
+
+  private updateHeading(marker: L.Marker, course: number): void {
+    const el = (marker as any)._icon as HTMLElement | undefined;
+    if (!el) return;
+    const inner = el.querySelector(".tram-marker") as HTMLElement | null;
+    if (inner) {
+      inner.style.transform = `rotate(${course}deg)`;
+    }
+    const label = el.querySelector(".tram-label") as HTMLElement | null;
+    if (label) {
+      label.style.transform = `rotate(-${course}deg)`;
     }
   }
 
@@ -100,5 +139,6 @@ export class VehicleLayer {
   clear(): void {
     this.layerGroup.clearLayers();
     this.markers.clear();
+    this.meta.clear();
   }
 }

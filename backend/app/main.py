@@ -41,6 +41,7 @@ async def lifespan(app: FastAPI):
     ws.tracker = tracker
     vehicles.tracker = tracker
     stops.tracker = tracker
+    routes.tracker = tracker
 
     # Load initial routes and stops
     try:

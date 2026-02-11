@@ -163,17 +163,15 @@ class EttuClient:
             )
             for item in items:
                 try:
-                    # Skip inactive stops (STATUS != "1" or empty name)
-                    status = str(item.get("STATUS", item.get("status", "1")))
-                    name = str(item.get("NAME", item.get("name", "")))
-                    if status != "1" or not name:
+                    stop_id = int(item.get("ID", item.get("id", 0)))
+                    if stop_id == 0:
                         continue
-                    stops.append(RawStop(
-                        id=int(item.get("ID", item.get("id", 0))),
-                        name=name,
-                        lat=float(item.get("LAT", item.get("lat", 0))),
-                        lon=float(item.get("LON", item.get("lon", item.get("lng", 0)))),
-                    ))
+                    name = str(item.get("NAME", item.get("name", ""))).strip()
+                    lat = float(item.get("LAT", item.get("lat", 0)))
+                    lon = float(item.get("LON", item.get("lon", item.get("lng", 0))))
+                    if lat == 0 or lon == 0:
+                        continue
+                    stops.append(RawStop(id=stop_id, name=name, lat=lat, lon=lon))
                 except (ValueError, TypeError):
                     continue
         except Exception:

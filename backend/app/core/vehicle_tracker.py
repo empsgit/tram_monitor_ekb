@@ -36,6 +36,9 @@ class VehicleTracker:
         self._route_num_to_id: dict[str, int] = {}
         self._route_id_to_num: dict[int, str] = {}
 
+        # Route geometries for API exposure: route_id -> [[lat, lon], ...]
+        self._route_geometries: dict[int, list[list[float]]] = {}
+
         # Current vehicle states (vehicle_id -> VehicleState)
         self.current_states: dict[str, VehicleState] = {}
 
@@ -44,7 +47,7 @@ class VehicleTracker:
         routes = await self.ettu.fetch_routes()
         stops = await self.ettu.fetch_stops()
 
-        # Build stop lookup
+        # Build stop lookup from ALL stops (including unnamed) for route resolution
         stop_lookup: dict[int, RawStop] = {s.id: s for s in stops}
 
         for route in routes:
@@ -70,8 +73,9 @@ class VehicleTracker:
                     if s["lat"] != 0 and s["lon"] != 0
                 ]
 
-            # Load route geometry
+            # Store geometry for API exposure
             if route.points:
+                self._route_geometries[route.id] = route.points
                 self.route_matcher.load_route(route.id, route.points)
 
             # Load stops for this route
@@ -100,11 +104,16 @@ class VehicleTracker:
 
             self.stop_detector.load_route_stops(route.id, route_stops)
 
-        # Save to database
+        # Save to database (only named stops)
         await self._persist_routes_stops(routes, stops)
         logger.info(
-            "Loaded %d routes and %d stops", len(routes), len(stops)
+            "Loaded %d routes, %d total stops (%d with geometry)",
+            len(routes), len(stops), len(self._route_geometries),
         )
+
+    def get_route_geometry(self, route_id: int) -> list[list[float]] | None:
+        """Get route geometry as [[lat, lon], ...] for API."""
+        return self._route_geometries.get(route_id)
 
     async def poll_vehicles(self) -> None:
         """Single poll cycle: fetch positions, process, publish."""
@@ -220,10 +229,12 @@ class VehicleTracker:
         self, routes: list[RawRoute], stops: list[RawStop]
     ) -> None:
         """Upsert routes and stops to database."""
-        # Phase 1: persist stops and routes (must succeed for data to show)
+        # Phase 1: persist named stops and routes
         try:
             async with self.session_factory() as session:
                 for s in stops:
+                    if not s.name:
+                        continue
                     await session.execute(
                         text("""
                             INSERT INTO stops (id, name, lat, lon)
@@ -248,15 +259,15 @@ class VehicleTracker:
             logger.exception("Failed to persist routes/stops to database")
             return
 
-        # Phase 2: persist route_stops (requires stops in DB, best-effort)
+        # Phase 2: persist route_stops (only for stops that are in DB)
         if not stops:
             return
         try:
             async with self.session_factory() as session:
-                stop_ids = {s.id for s in stops}
+                named_stop_ids = {s.id for s in stops if s.name}
                 for r in routes:
                     for s in r.stops:
-                        if s["id"] not in stop_ids:
+                        if s["id"] not in named_stop_ids:
                             continue
                         await session.execute(
                             text("""
