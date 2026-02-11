@@ -31,6 +31,7 @@ class RouteDetail(BaseModel):
 class StopInfoFull(BaseModel):
     id: int
     name: str
+    direction: str = ""
     lat: float
     lon: float
     routes: list[str] = []

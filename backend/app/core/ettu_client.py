@@ -33,6 +33,7 @@ class RawStop:
     name: str
     lat: float
     lon: float
+    direction: str = ""  # e.g. "на Пионерскую"
 
 
 @dataclass
@@ -171,7 +172,8 @@ class EttuClient:
                     lon = float(item.get("LON", item.get("lon", item.get("lng", 0))))
                     if lat == 0 or lon == 0:
                         continue
-                    stops.append(RawStop(id=stop_id, name=name, lat=lat, lon=lon))
+                    direction = str(item.get("DIRECTION", item.get("direction", ""))).strip()
+                    stops.append(RawStop(id=stop_id, name=name, lat=lat, lon=lon, direction=direction))
                 except (ValueError, TypeError):
                     continue
         except Exception:

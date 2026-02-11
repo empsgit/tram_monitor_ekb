@@ -25,7 +25,10 @@ export class StopLayer {
         weight: 1.5,
       });
 
-      marker.bindTooltip(stop.name, {
+      const label = stop.direction
+        ? `${stop.name} (${stop.direction})`
+        : stop.name;
+      marker.bindTooltip(label, {
         direction: "top",
         offset: [0, -6],
         className: "stop-tooltip",
