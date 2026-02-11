@@ -65,7 +65,7 @@ class EttuClient:
             resp = await self._client.get("/api/v2/tram/boards/")
             resp.raise_for_status()
             data = resp.json()
-            logger.info("DEBUG boards response type=%s sample=%s", type(data).__name__, str(data)[:500])
+            logger.debug("Boards response keys=%s count=%d", list(data.keys()) if isinstance(data, dict) else "list", len(data if isinstance(data, list) else data.get("vehicles", [])))
         except httpx.HTTPStatusError:
             # Fallback: try trolleybus endpoint and filter by layer
             try:
@@ -91,14 +91,14 @@ class EttuClient:
                     route_num=str(item.get("ROUTE", item.get("route", item.get("marsh", "")))),
                     lat=float(item.get("LAT", item.get("lat", 0))),
                     lon=float(item.get("LON", item.get("lon", item.get("lng", 0)))),
-                    speed=float(item.get("SPEED", item.get("speed", 0))),
+                    speed=float(item.get("VELOCITY", item.get("SPEED", item.get("speed", 0)))),
                     course=float(item.get("COURSE", item.get("course", item.get("dir", 0)))),
                     on_route=bool(int(on_route)) if on_route is not None else False,
                     layer=layer,
-                    timestamp=str(item.get("TIMESTAMP", item.get("timestamp", item.get("last_time", "")))),
+                    timestamp=str(item.get("ATIME", item.get("TIMESTAMP", item.get("timestamp", "")))),
                 )
-                # Only include trams that are on route
-                if vehicle.on_route and vehicle.lat != 0 and vehicle.lon != 0:
+                # Include trams with valid coordinates and a route assigned
+                if vehicle.lat != 0 and vehicle.lon != 0 and vehicle.route_num:
                     vehicles.append(vehicle)
             except (ValueError, TypeError) as e:
                 logger.debug("Skipping malformed vehicle record: %s", e)
@@ -114,40 +114,35 @@ class EttuClient:
             resp = await self._client.get("/api/v2/tram/routes/")
             resp.raise_for_status()
             data = resp.json()
-            logger.info("DEBUG routes response type=%s sample=%s", type(data).__name__, str(data)[:500])
+            logger.debug("Routes response keys=%s count=%d", list(data.keys()) if isinstance(data, dict) else "list", len(data if isinstance(data, list) else data.get("routes", [])))
 
             items = data if isinstance(data, list) else data.get("routes", [])
             for item in items:
                 route = RawRoute(
-                    id=int(item.get("ID", item.get("id", 0))),
-                    number=str(item.get("NUM", item.get("number", item.get("name", "")))),
-                    name=str(item.get("NAME", item.get("title", ""))),
+                    id=int(item.get("id", item.get("ID", 0))),
+                    number=str(item.get("num", item.get("NUM", item.get("number", "")))),
+                    name=str(item.get("name", item.get("NAME", item.get("title", "")))),
                 )
-                # Try to get route geometry
-                points = item.get("POINTS", item.get("points", item.get("geometry", [])))
-                if isinstance(points, list):
-                    for pt in points:
-                        if isinstance(pt, dict):
-                            route.points.append([
-                                float(pt.get("LAT", pt.get("lat", 0))),
-                                float(pt.get("LON", pt.get("lon", pt.get("lng", 0)))),
-                            ])
-                        elif isinstance(pt, (list, tuple)) and len(pt) >= 2:
-                            route.points.append([float(pt[0]), float(pt[1])])
 
-                # Try to get stops for this route
-                stop_data = item.get("STOPS", item.get("stops", []))
-                if isinstance(stop_data, list):
-                    for s in stop_data:
-                        if isinstance(s, dict):
-                            route.stops.append({
-                                "id": int(s.get("ID", s.get("id", 0))),
-                                "name": str(s.get("NAME", s.get("name", ""))),
-                                "lat": float(s.get("LAT", s.get("lat", 0))),
-                                "lon": float(s.get("LON", s.get("lon", s.get("lng", 0)))),
-                                "order": int(s.get("ORDER", s.get("order", 0))),
-                                "direction": int(s.get("DIRECTION", s.get("direction", 0))),
-                            })
+                # Parse elements → extract ordered stop IDs from path
+                elements = item.get("elements", [])
+                if isinstance(elements, list):
+                    for elem in elements:
+                        direction = int(elem.get("ind", 0))
+                        path = elem.get("path", [])
+                        if isinstance(path, list):
+                            for order, stop_id_str in enumerate(path):
+                                try:
+                                    route.stops.append({
+                                        "id": int(stop_id_str),
+                                        "name": "",
+                                        "lat": 0.0,
+                                        "lon": 0.0,
+                                        "order": order,
+                                        "direction": direction,
+                                    })
+                                except (ValueError, TypeError):
+                                    continue
 
                 routes.append(route)
         except Exception:
@@ -163,16 +158,16 @@ class EttuClient:
             resp = await self._client.get("/api/v2/tram/stops/")
             resp.raise_for_status()
             data = resp.json()
-            logger.info("DEBUG stops response type=%s sample=%s", type(data).__name__, str(data)[:500])
+            logger.debug("Stops response keys=%s count=%d", list(data.keys()) if isinstance(data, dict) else "list", len(data if isinstance(data, list) else data.get("stops", [])))
 
             items = data if isinstance(data, list) else data.get("stops", [])
             for item in items:
                 try:
                     stops.append(RawStop(
-                        id=int(item.get("ID", item.get("id", 0))),
-                        name=str(item.get("NAME", item.get("name", ""))),
-                        lat=float(item.get("LAT", item.get("lat", 0))),
-                        lon=float(item.get("LON", item.get("lon", item.get("lng", 0)))),
+                        id=int(item.get("id", item.get("ID", 0))),
+                        name=str(item.get("name", item.get("NAME", ""))),
+                        lat=float(item.get("lat", item.get("LAT", 0))),
+                        lon=float(item.get("lon", item.get("LON", item.get("lng", 0)))),
                     ))
                 except (ValueError, TypeError):
                     continue

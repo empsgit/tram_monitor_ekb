@@ -51,6 +51,25 @@ class VehicleTracker:
             self._route_num_to_id[route.number] = route.id
             self._route_id_to_num[route.id] = route.number
 
+            # Resolve stop coordinates from the global stop list
+            resolved_stops = []
+            for s in route.stops:
+                stop_info = stop_lookup.get(s["id"])
+                if stop_info:
+                    s["name"] = stop_info.name
+                    s["lat"] = stop_info.lat
+                    s["lon"] = stop_info.lon
+                    resolved_stops.append(s)
+            route.stops = resolved_stops
+
+            # Build route geometry from ordered stop coordinates
+            if not route.points and route.stops:
+                route.points = [
+                    [s["lat"], s["lon"]]
+                    for s in route.stops
+                    if s["lat"] != 0 and s["lon"] != 0
+                ]
+
             # Load route geometry
             if route.points:
                 self.route_matcher.load_route(route.id, route.points)
@@ -60,7 +79,6 @@ class VehicleTracker:
             for s in route.stops:
                 # Calculate distance along route for each stop
                 if route.points:
-                    from app.core.route_matcher import RouteMatcher as RM
                     match = self.route_matcher.match(route.id, s["lat"], s["lon"])
                     if match:
                         total_len = self.route_matcher.get_total_length(route.id)
