@@ -5,6 +5,7 @@ export interface RouteInfo {
   number: string;
   name: string;
   color: string;
+  geometry: number[][] | null;
 }
 
 export interface StopInfo {

@@ -41,7 +41,7 @@ class StopArrival(BaseModel):
     vehicle_id: str
     board_num: str
     route: str
-    route_id: int
+    route_id: int | None = None
     eta_seconds: int | None = None
     distance_m: float | None = None
 

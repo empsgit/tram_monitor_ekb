@@ -11,13 +11,25 @@ from app.schemas.route import RouteDetail, RouteInfo, RouteStopInfo
 
 router = APIRouter(prefix="/api/routes", tags=["routes"])
 
+# Will be set by main.py
+tracker = None
+
 
 @router.get("", response_model=list[RouteInfo])
 async def list_routes(session: AsyncSession = Depends(get_session)):
-    """Get all tram routes."""
+    """Get all tram routes with geometry."""
     result = await session.execute(select(Route).order_by(Route.number))
     routes = result.scalars().all()
-    return [RouteInfo(id=r.id, number=r.number, name=r.name, color=r.color) for r in routes]
+    route_infos = []
+    for r in routes:
+        geometry = None
+        if tracker:
+            geometry = tracker.get_route_geometry(r.id)
+        route_infos.append(RouteInfo(
+            id=r.id, number=r.number, name=r.name, color=r.color,
+            geometry=geometry,
+        ))
+    return route_infos
 
 
 @router.get("/{route_id}", response_model=RouteDetail)
@@ -42,9 +54,9 @@ async def get_route(route_id: int, session: AsyncSession = Depends(get_session))
             direction=rs.direction,
         ))
 
-    # Extract geometry coordinates if available
     geometry = None
-    # Geometry will be available from the route_matcher in the tracker
+    if tracker:
+        geometry = tracker.get_route_geometry(route.id)
 
     return RouteDetail(
         id=route.id,

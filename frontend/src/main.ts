@@ -3,6 +3,7 @@
 import { initMap } from "./map/map-controller";
 import { VehicleLayer } from "./map/vehicle-layer";
 import { StopLayer } from "./map/stop-layer";
+import { RouteLayer } from "./map/route-layer";
 import { WsClient } from "./services/ws-client";
 import { getRoutes, getStops } from "./services/api-client";
 import { store } from "./services/state";
@@ -19,6 +20,7 @@ async function main() {
   const map = initMap();
   const vehicleLayer = new VehicleLayer(map);
   const stopLayer = new StopLayer(map);
+  const routeLayer = new RouteLayer(map);
 
   // DOM elements
   const statusDot = document.getElementById("status-dot")!;
@@ -55,6 +57,7 @@ async function main() {
     store.setRoutes(routes);
     store.setStops(stops);
     stopLayer.loadStops(stops);
+    routeLayer.loadRoutes(routes);
     renderRouteFilter(routeFilterEl, routes);
   } catch (e) {
     console.error("Failed to load initial data:", e);
@@ -89,6 +92,9 @@ async function main() {
     vehicleLayer.update(visible);
     renderVehicleList(vehicleListEl, visible);
     vehicleCount.textContent = `${visible.length} трамваев`;
+
+    // Update route line visibility
+    routeLayer.setVisibility(store.state.routes, store.state.enabledRoutes);
 
     // Highlight selected stop
     if (store.state.selectedStop) {
