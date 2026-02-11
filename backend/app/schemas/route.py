@@ -7,6 +7,7 @@ class RouteInfo(BaseModel):
     name: str
     color: str
     geometry: list[list[float]] | None = None
+    stop_ids: list[int] = []
 
 
 class RouteStopInfo(BaseModel):

@@ -1,10 +1,12 @@
 """Main orchestrator: fetches vehicle data, processes through pipeline, publishes updates."""
 
+import asyncio
 import datetime
 import logging
+import math
 
+import httpx
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.broadcaster import Broadcaster
 from app.core.eta_calculator import EtaCalculator
@@ -14,6 +16,19 @@ from app.core.stop_detector import StopDetector, StopOnRoute
 from app.schemas.vehicle import VehicleState, NextStopInfo, StopInfo
 
 logger = logging.getLogger(__name__)
+
+OSRM_BASE = "https://router.project-osrm.org"
+
+
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance in meters between two lat/lon points."""
+    R = 6_371_000
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    return R * 2 * math.asin(math.sqrt(a))
 
 
 class VehicleTracker:
@@ -39,6 +54,15 @@ class VehicleTracker:
         # Route geometries for API exposure: route_id -> [[lat, lon], ...]
         self._route_geometries: dict[int, list[list[float]]] = {}
 
+        # Route stop IDs (named only) for frontend filtering
+        self._route_stop_ids: dict[int, list[int]] = {}
+
+        # stop_id -> set of route_ids that serve it
+        self._stop_to_routes: dict[int, set[int]] = {}
+
+        # stop_id -> (lat, lon) for distance calculations
+        self._stop_coords: dict[int, tuple[float, float]] = {}
+
         # Current vehicle states (vehicle_id -> VehicleState)
         self.current_states: dict[str, VehicleState] = {}
 
@@ -49,6 +73,10 @@ class VehicleTracker:
 
         # Build stop lookup from ALL stops (including unnamed) for route resolution
         stop_lookup: dict[int, RawStop] = {s.id: s for s in stops}
+
+        # Cache stop coordinates
+        for s in stops:
+            self._stop_coords[s.id] = (s.lat, s.lon)
 
         for route in routes:
             self._route_num_to_id[route.number] = route.id
@@ -65,8 +93,19 @@ class VehicleTracker:
                     resolved_stops.append(s)
             route.stops = resolved_stops
 
-            # Build route geometry from ordered stop coordinates
-            if not route.points and route.stops:
+            # Build stop-route association
+            named_ids = set()
+            for s in route.stops:
+                self._stop_to_routes.setdefault(s["id"], set()).add(route.id)
+                if s["name"]:
+                    named_ids.add(s["id"])
+            self._route_stop_ids[route.id] = list(named_ids)
+
+            # Try OSRM for road-snapped geometry, fall back to stop-to-stop lines
+            osrm_geom = await self._fetch_osrm_geometry(route.stops)
+            if osrm_geom:
+                route.points = osrm_geom
+            elif not route.points and route.stops:
                 route.points = [
                     [s["lat"], s["lon"]]
                     for s in route.stops
@@ -81,7 +120,6 @@ class VehicleTracker:
             # Load stops for this route
             route_stops = []
             for s in route.stops:
-                # Calculate distance along route for each stop
                 if route.points:
                     match = self.route_matcher.match(route.id, s["lat"], s["lon"])
                     if match:
@@ -104,6 +142,9 @@ class VehicleTracker:
 
             self.stop_detector.load_route_stops(route.id, route_stops)
 
+            # Small delay between OSRM requests to avoid rate limiting
+            await asyncio.sleep(0.3)
+
         # Save to database (only named stops)
         await self._persist_routes_stops(routes, stops)
         logger.info(
@@ -114,6 +155,10 @@ class VehicleTracker:
     def get_route_geometry(self, route_id: int) -> list[list[float]] | None:
         """Get route geometry as [[lat, lon], ...] for API."""
         return self._route_geometries.get(route_id)
+
+    def get_route_stop_ids(self, route_id: int) -> list[int]:
+        """Get named stop IDs for a route."""
+        return self._route_stop_ids.get(route_id, [])
 
     async def poll_vehicles(self) -> None:
         """Single poll cycle: fetch positions, process, publish."""
@@ -167,9 +212,9 @@ class VehicleTracker:
         total_len = self.route_matcher.get_total_length(route_id)
         distance_along = match.progress * total_len
 
-        # Stop detection
+        # Stop detection (up to 5 next stops for richer data)
         detection = self.stop_detector.detect(
-            route_id, distance_along, match.direction
+            route_id, distance_along, match.direction, max_next=5
         )
 
         if detection.prev_stop:
@@ -193,6 +238,31 @@ class VehicleTracker:
             ]
 
         return state
+
+    async def _fetch_osrm_geometry(
+        self, stops: list[dict]
+    ) -> list[list[float]] | None:
+        """Fetch road-snapped geometry from OSRM for forward direction stops."""
+        fwd = [s for s in stops
+               if s["direction"] == 0 and s["lat"] != 0 and s["lon"] != 0]
+        if len(fwd) < 2:
+            return None
+
+        coords = ";".join(f"{s['lon']:.6f},{s['lat']:.6f}" for s in fwd)
+        url = f"{OSRM_BASE}/route/v1/driving/{coords}?overview=full&geometries=geojson"
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("code") == "Ok" and data.get("routes"):
+                    geojson = data["routes"][0]["geometry"]["coordinates"]
+                    # Convert [lon, lat] → [lat, lon]
+                    return [[c[1], c[0]] for c in geojson]
+        except Exception as e:
+            logger.debug("OSRM geometry fetch failed: %s", e)
+        return None
 
     async def _persist_positions(self, vehicles: list[RawVehicle]) -> None:
         """Save vehicle positions to database."""
@@ -287,9 +357,13 @@ class VehicleTracker:
         except Exception:
             logger.exception("Failed to persist route_stops to database")
 
-    def get_vehicles_for_stop(self, stop_id: int, route_filter: int | None = None) -> list[dict]:
+    def get_vehicles_for_stop(
+        self, stop_id: int, route_filter: int | None = None
+    ) -> list[dict]:
         """Get upcoming vehicles for a specific stop."""
+        # Try pipeline-based approach first (vehicles with this stop in next_stops)
         arrivals = []
+        seen_vehicles: set[str] = set()
         for vid, state in self.current_states.items():
             if route_filter and state.route_id != route_filter:
                 continue
@@ -302,7 +376,34 @@ class VehicleTracker:
                         "route_id": state.route_id,
                         "eta_seconds": ns.eta_seconds,
                     })
+                    seen_vehicles.add(vid)
                     break
-        # Sort by ETA
+
+        # Fallback: find vehicles on routes serving this stop, estimate by distance
+        serving_routes = self._stop_to_routes.get(stop_id, set())
+        stop_loc = self._stop_coords.get(stop_id)
+        if serving_routes and stop_loc:
+            for vid, state in self.current_states.items():
+                if vid in seen_vehicles:
+                    continue
+                if state.route_id not in serving_routes:
+                    continue
+                if route_filter and state.route_id != route_filter:
+                    continue
+
+                dist_m = _haversine(state.lat, state.lon, stop_loc[0], stop_loc[1])
+                speed = max(state.speed, 5.0)
+                eta_s = int(dist_m / (speed / 3.6))
+                if eta_s > 3600:
+                    continue
+
+                arrivals.append({
+                    "vehicle_id": state.id,
+                    "board_num": state.board_num,
+                    "route": state.route,
+                    "route_id": state.route_id,
+                    "eta_seconds": eta_s,
+                })
+
         arrivals.sort(key=lambda a: a.get("eta_seconds") or 9999)
-        return arrivals
+        return arrivals[:15]

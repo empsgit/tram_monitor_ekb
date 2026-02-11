@@ -41,7 +41,6 @@ class Store {
   }
 
   updateVehicles(vehicles: VehicleData[]): void {
-    // Mark all as stale first if snapshot
     for (const v of vehicles) {
       this.state.vehicles.set(v.id, v);
     }
@@ -50,7 +49,6 @@ class Store {
 
   setRoutes(routes: RouteInfo[]): void {
     this.state.routes = routes;
-    // Enable all routes by default
     this.state.enabledRoutes = new Set(routes.map((r) => r.number));
     this.notify();
   }
@@ -69,6 +67,16 @@ class Store {
     this.notify();
   }
 
+  enableAllRoutes(): void {
+    this.state.enabledRoutes = new Set(this.state.routes.map((r) => r.number));
+    this.notify();
+  }
+
+  disableAllRoutes(): void {
+    this.state.enabledRoutes.clear();
+    this.notify();
+  }
+
   selectStop(stopId: number | null): void {
     this.state.selectedStop = stopId;
     this.notify();
@@ -83,6 +91,24 @@ class Store {
       }
     }
     return result;
+  }
+
+  /** Returns stop IDs that belong to at least one enabled route, or null if all routes are enabled. */
+  getActiveStopIds(): Set<number> | null {
+    const allEnabled = this.state.routes.every((r) =>
+      this.state.enabledRoutes.has(r.number)
+    );
+    if (allEnabled) return null;
+
+    const ids = new Set<number>();
+    for (const route of this.state.routes) {
+      if (this.state.enabledRoutes.has(route.number)) {
+        for (const id of route.stop_ids) {
+          ids.add(id);
+        }
+      }
+    }
+    return ids;
   }
 }
 

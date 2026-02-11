@@ -23,11 +23,13 @@ async def list_routes(session: AsyncSession = Depends(get_session)):
     route_infos = []
     for r in routes:
         geometry = None
+        stop_ids: list[int] = []
         if tracker:
             geometry = tracker.get_route_geometry(r.id)
+            stop_ids = tracker.get_route_stop_ids(r.id)
         route_infos.append(RouteInfo(
             id=r.id, number=r.number, name=r.name, color=r.color,
-            geometry=geometry,
+            geometry=geometry, stop_ids=stop_ids,
         ))
     return route_infos
 

@@ -9,7 +9,7 @@ from shapely.geometry import LineString, Point
 logger = logging.getLogger(__name__)
 
 # Max distance (meters) from route to consider a valid snap
-MAX_SNAP_DISTANCE_M = 150
+MAX_SNAP_DISTANCE_M = 300
 
 # Approximate meters per degree at Yekaterinburg latitude (~56.8)
 LAT_M_PER_DEG = 111_320.0

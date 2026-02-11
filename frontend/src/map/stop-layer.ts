@@ -1,4 +1,4 @@
-/** Manages stop markers on the map. */
+/** Manages stop markers on the map with visibility dimming. */
 
 import L from "leaflet";
 import type { StopInfo } from "../services/api-client";
@@ -33,7 +33,6 @@ export class StopLayer {
 
       marker.on("click", () => {
         store.selectStop(stop.id);
-        // Switch to station tab
         document.querySelector('.tab[data-tab="station"]')?.dispatchEvent(
           new Event("click")
         );
@@ -44,21 +43,28 @@ export class StopLayer {
     }
   }
 
-  highlightStop(stopId: number): void {
-    // Reset all
+  /** Dim stops not in the active set. Pass null to show all normally. */
+  setDimming(activeStopIds: Set<number> | null): void {
     for (const [id, m] of this.markers) {
-      m.setStyle({
-        radius: 4,
-        fillColor: "#60a5fa",
-        weight: 1.5,
-      });
+      if (activeStopIds === null || activeStopIds.has(id)) {
+        m.setStyle({ fillOpacity: 0.8, radius: 4, fillColor: "#60a5fa" });
+      } else {
+        m.setStyle({ fillOpacity: 0.12, radius: 2, fillColor: "#94a3b8" });
+      }
     }
-    // Highlight selected
+  }
+
+  highlightStop(stopId: number): void {
+    // Reset all to default (dimming will be re-applied by caller)
+    for (const [, m] of this.markers) {
+      m.setStyle({ radius: 4, fillColor: "#60a5fa", weight: 1.5 });
+    }
     const selected = this.markers.get(stopId);
     if (selected) {
       selected.setStyle({
         radius: 8,
         fillColor: "#e94560",
+        fillOpacity: 1,
         weight: 3,
       });
       selected.bringToFront();

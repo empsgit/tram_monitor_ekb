@@ -2,21 +2,7 @@
 
 import type { VehicleData } from "../services/ws-client";
 import { flyTo } from "../map/map-controller";
-
-const COLORS = [
-  "#e53935", "#d81b60", "#8e24aa", "#5e35b1", "#3949ab",
-  "#1e88e5", "#039be5", "#00acc1", "#00897b", "#43a047",
-  "#7cb342", "#c0ca33", "#fdd835", "#ffb300", "#fb8c00",
-  "#f4511e", "#6d4c41", "#546e7a",
-];
-
-function routeColor(routeNum: string): string {
-  let hash = 0;
-  for (let i = 0; i < routeNum.length; i++) {
-    hash = routeNum.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  return COLORS[Math.abs(hash) % COLORS.length];
-}
+import { routeColor } from "../map/vehicle-layer";
 
 function formatEta(seconds: number | null | undefined): string {
   if (seconds == null) return "";
@@ -28,7 +14,6 @@ export function renderVehicleList(
   container: HTMLElement,
   vehicles: VehicleData[]
 ): void {
-  // Sort by route number
   const sorted = [...vehicles].sort((a, b) =>
     a.route.localeCompare(b.route, undefined, { numeric: true })
   );
@@ -42,8 +27,14 @@ export function renderVehicleList(
     card.className = "vehicle-card";
     card.addEventListener("click", () => flyTo(v.lat, v.lon));
 
-    const nextStop = v.next_stops[0];
-    const eta = formatEta(nextStop?.eta_seconds);
+    const stopsHtml = v.next_stops.slice(0, 3).map((ns, i) => {
+      const eta = formatEta(ns.eta_seconds);
+      const cls = i === 0 ? "next-stop" : "next-stop-dim";
+      return `<div class="stop-row">
+        <span class="${cls}">${ns.name}</span>
+        ${eta ? `<span class="eta-badge">${eta}</span>` : ""}
+      </div>`;
+    }).join("");
 
     card.innerHTML = `
       <div class="vehicle-card-header">
@@ -52,8 +43,8 @@ export function renderVehicleList(
         <span class="vehicle-board">#${v.board_num}</span>
       </div>
       <div class="vehicle-stops">
-        ${v.prev_stop ? `<span style="color:var(--text-muted)">${v.prev_stop.name}</span> → ` : ""}
-        ${nextStop ? `<span class="next-stop">${nextStop.name}</span>${eta ? `<span class="eta-badge">${eta}</span>` : ""}` : '<span style="color:var(--text-muted)">на маршруте</span>'}
+        ${v.prev_stop ? `<div class="prev-stop-label">от: ${v.prev_stop.name}</div>` : ""}
+        ${stopsHtml || '<span style="color:var(--text-muted)">на маршруте</span>'}
       </div>
     `;
     container.appendChild(card);
