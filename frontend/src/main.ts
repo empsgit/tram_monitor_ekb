@@ -80,11 +80,8 @@ async function main() {
   };
 
   wsClient.subscribe((msg) => {
+    // Only update store; the store subscriber handles all rendering
     store.updateVehicles(msg.vehicles);
-    const visible = store.getVisibleVehicles();
-    vehicleLayer.update(visible);
-    renderVehicleList(vehicleListEl, visible);
-    vehicleCount.textContent = `${visible.length} трамваев`;
   });
 
   wsClient.connect();
