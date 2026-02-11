@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Трамваи Екатеринбурга — онлайн</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="/src/styles/main.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="map"></div>
+    <div id="panel" class="panel">
+      <div class="panel-handle" id="panel-handle"></div>
+      <div class="panel-header">
+        <h1 class="panel-title">Трамваи Екатеринбурга</h1>
+        <div class="panel-tabs">
+          <button class="tab active" data-tab="list">Трамваи</button>
+          <button class="tab" data-tab="station">Остановка</button>
+          <button class="tab" data-tab="routes">Маршруты</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div id="tab-list" class="tab-content active">
+          <div id="vehicle-list" class="vehicle-list"></div>
+        </div>
+        <div id="tab-station" class="tab-content">
+          <div id="station-search">
+            <input type="text" id="stop-search" placeholder="Поиск остановки..." class="search-input" />
+          </div>
+          <div id="station-detail"></div>
+        </div>
+        <div id="tab-routes" class="tab-content">
+          <div id="route-filter" class="route-filter"></div>
+        </div>
+      </div>
+    </div>
+    <div id="status-bar" class="status-bar">
+      <span id="status-dot" class="status-dot"></span>
+      <span id="status-text">Подключение...</span>
+      <span id="vehicle-count"></span>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

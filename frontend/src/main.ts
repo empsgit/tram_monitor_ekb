@@ -1,0 +1,100 @@
+/** Main entry point: initialize map, connect WebSocket, wire up UI. */
+
+import { initMap } from "./map/map-controller";
+import { VehicleLayer } from "./map/vehicle-layer";
+import { StopLayer } from "./map/stop-layer";
+import { WsClient } from "./services/ws-client";
+import { getRoutes, getStops } from "./services/api-client";
+import { store } from "./services/state";
+import { renderVehicleList } from "./ui/vehicle-list";
+import {
+  renderStopSearch,
+  renderStationDetail,
+  setupStationAutoRefresh,
+} from "./ui/station-detail";
+import { renderRouteFilter } from "./ui/route-filter";
+
+async function main() {
+  // Initialize map
+  const map = initMap();
+  const vehicleLayer = new VehicleLayer(map);
+  const stopLayer = new StopLayer(map);
+
+  // DOM elements
+  const statusDot = document.getElementById("status-dot")!;
+  const statusText = document.getElementById("status-text")!;
+  const vehicleCount = document.getElementById("vehicle-count")!;
+  const vehicleListEl = document.getElementById("vehicle-list")!;
+  const stationDetailEl = document.getElementById("station-detail")!;
+  const stopSearchEl = document.getElementById("stop-search") as HTMLInputElement;
+  const routeFilterEl = document.getElementById("route-filter")!;
+
+  // Tabs
+  const tabs = document.querySelectorAll<HTMLElement>(".tab");
+  const tabContents = document.querySelectorAll<HTMLElement>(".tab-content");
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      tabs.forEach((t) => t.classList.remove("active"));
+      tabContents.forEach((tc) => tc.classList.remove("active"));
+      tab.classList.add("active");
+      const target = tab.dataset.tab!;
+      document.getElementById(`tab-${target}`)!.classList.add("active");
+    });
+  });
+
+  // Mobile panel handle
+  const panel = document.getElementById("panel")!;
+  const panelHandle = document.getElementById("panel-handle")!;
+  panelHandle.addEventListener("click", () => {
+    panel.classList.toggle("expanded");
+  });
+
+  // Load routes and stops from API
+  try {
+    const [routes, stops] = await Promise.all([getRoutes(), getStops()]);
+    store.setRoutes(routes);
+    store.setStops(stops);
+    stopLayer.loadStops(stops);
+    renderRouteFilter(routeFilterEl, routes);
+  } catch (e) {
+    console.error("Failed to load initial data:", e);
+  }
+
+  // Set up stop search
+  renderStopSearch(stopSearchEl, stationDetailEl);
+  setupStationAutoRefresh(stationDetailEl);
+
+  // WebSocket connection
+  const wsClient = new WsClient();
+
+  wsClient.onStatusChange = (connected) => {
+    store.setConnected(connected);
+    statusDot.classList.toggle("connected", connected);
+    statusText.textContent = connected ? "Онлайн" : "Подключение...";
+  };
+
+  wsClient.subscribe((msg) => {
+    store.updateVehicles(msg.vehicles);
+    const visible = store.getVisibleVehicles();
+    vehicleLayer.update(visible);
+    renderVehicleList(vehicleListEl, visible);
+    vehicleCount.textContent = `${visible.length} трамваев`;
+  });
+
+  wsClient.connect();
+
+  // Re-render when route filter changes
+  store.subscribe(() => {
+    const visible = store.getVisibleVehicles();
+    vehicleLayer.update(visible);
+    renderVehicleList(vehicleListEl, visible);
+    vehicleCount.textContent = `${visible.length} трамваев`;
+
+    // Highlight selected stop
+    if (store.state.selectedStop) {
+      stopLayer.highlightStop(store.state.selectedStop);
+    }
+  });
+}
+
+main().catch(console.error);
