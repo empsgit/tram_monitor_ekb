@@ -16,13 +16,11 @@ import {
 import { renderRouteFilter } from "./ui/route-filter";
 
 async function main() {
-  // Initialize map
   const map = initMap();
   const vehicleLayer = new VehicleLayer(map);
   const stopLayer = new StopLayer(map);
   const routeLayer = new RouteLayer(map);
 
-  // DOM elements
   const statusDot = document.getElementById("status-dot")!;
   const statusText = document.getElementById("status-text")!;
   const vehicleCount = document.getElementById("vehicle-count")!;
@@ -95,6 +93,9 @@ async function main() {
 
     // Update route line visibility
     routeLayer.setVisibility(store.state.routes, store.state.enabledRoutes);
+
+    // Dim stops not on selected routes
+    stopLayer.setDimming(store.getActiveStopIds());
 
     // Highlight selected stop
     if (store.state.selectedStop) {

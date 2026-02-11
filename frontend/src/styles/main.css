@@ -184,9 +184,27 @@ html, body {
   margin-top: 4px;
 }
 
+.prev-stop-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+
+.stop-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1px 0;
+}
+
 .vehicle-stops .next-stop {
   color: var(--accent-green);
   font-weight: 600;
+}
+
+.vehicle-stops .next-stop-dim {
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .eta-badge {
@@ -198,6 +216,7 @@ html, body {
   font-size: 11px;
   font-weight: 600;
   margin-left: 4px;
+  white-space: nowrap;
 }
 
 /* === Station Detail === */
@@ -252,6 +271,35 @@ html, body {
 /* === Route Filter === */
 .route-filter {
   display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.route-filter-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.filter-btn {
+  flex: 1;
+  padding: 8px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.filter-btn:hover {
+  border-color: var(--accent-blue);
+  background: rgba(37, 99, 235, 0.05);
+}
+
+.route-chips {
+  display: flex;
   flex-wrap: wrap;
   gap: 8px;
 }
@@ -269,7 +317,7 @@ html, body {
 }
 
 .route-chip.disabled {
-  opacity: 0.3;
+  opacity: 0.25;
 }
 
 /* === Leaflet Custom Markers === */
@@ -310,6 +358,16 @@ html, body {
   border: 2px solid white;
   border-radius: 50%;
   box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
+
+/* === Tooltips === */
+.route-tooltip {
+  background: rgba(0,0,0,0.75) !important;
+  color: white !important;
+  border: none !important;
+  border-radius: 4px !important;
+  font-size: 12px;
+  padding: 4px 8px;
 }
 
 /* === Mobile === */
