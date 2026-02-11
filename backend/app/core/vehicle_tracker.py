@@ -22,6 +22,10 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 # Bounding box for Ekaterinburg tram network (south,west,north,east)
 EKB_BBOX = "56.7,60.4,56.95,60.8"
 
+# Approximate meters per degree at Yekaterinburg latitude (~56.8)
+LAT_M_PER_DEG = 111_320.0
+LON_M_PER_DEG = 111_320.0 * math.cos(math.radians(56.84))
+
 
 def _stop_display_name(name: str, direction: str) -> str:
     """Combine stop name with direction label, e.g. '1-й км (на Пионерскую)'."""
@@ -82,6 +86,9 @@ class VehicleTracker:
         # Per-vehicle smoothing state for progress and speed
         self._smooth: dict[str, dict] = {}
         # {vehicle_id: {"progress": float, "speed": float, "direction": int, "route_id": int}}
+
+        # Recent GPS positions for bearing calculation (last 3 points)
+        self._recent_positions: dict[str, list[tuple[float, float]]] = {}
 
         # Per-vehicle stop passage tracking for travel time recording
         # {vehicle_id: {"stop_id": int, "route_id": int, "time": datetime}}
@@ -273,8 +280,28 @@ class VehicleTracker:
         if route_id is None:
             return state
 
+        # Track recent positions for bearing calculation
+        positions = self._recent_positions.get(rv.dev_id, [])
+        positions.append((rv.lat, rv.lon))
+        if len(positions) > 3:
+            positions = positions[-3:]
+        self._recent_positions[rv.dev_id] = positions
+
+        # Compute bearing from recent movement (last 3 points) instead of noisy GPS heading
+        if len(positions) >= 2:
+            p_old, p_new = positions[0], positions[-1]
+            dlat = p_new[0] - p_old[0]
+            dlon = p_new[1] - p_old[1]
+            dist_sq = dlat * dlat + dlon * dlon
+            if dist_sq > 1e-10:  # moved at least ~1m
+                movement_bearing = math.degrees(math.atan2(dlon * LON_M_PER_DEG, dlat * LAT_M_PER_DEG)) % 360
+            else:
+                movement_bearing = rv.course  # stationary — fall back to GPS heading
+        else:
+            movement_bearing = rv.course
+
         # Route matching — project raw GPS onto route line
-        match = self.route_matcher.match(route_id, rv.lat, rv.lon, rv.course)
+        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing)
         if not match:
             # Clear stale smoothing if vehicle can't be matched
             self._smooth.pop(rv.dev_id, None)
@@ -284,9 +311,11 @@ class VehicleTracker:
         direction = match.direction
 
         # --- Smooth progress and speed ---
+        # Max progress change per cycle (~10s): 60 km/h on a 5km route = ~3.3%
+        MAX_DELTA = 0.05
         prev = self._smooth.get(rv.dev_id)
         if prev and prev["route_id"] == route_id and prev["direction"] == direction:
-            # Same route + direction: apply EMA with monotonic constraint
+            # Same route + direction: apply EMA with monotonic + clamped delta
             alpha = 0.4
             smoothed = prev["progress"] * (1 - alpha) + raw_progress * alpha
 
@@ -296,10 +325,10 @@ class VehicleTracker:
             else:
                 smoothed = min(smoothed, prev["progress"])
 
-            # Allow reset if raw position jumps far (route wrap-around or GPS jump)
-            delta = abs(raw_progress - prev["progress"])
-            if delta > 0.15:
-                smoothed = raw_progress  # Accept the jump
+            # Clamp max step to prevent full-route traversal from GPS glitches
+            delta = smoothed - prev["progress"]
+            if abs(delta) > MAX_DELTA:
+                smoothed = prev["progress"] + MAX_DELTA * (1 if delta > 0 else -1)
 
             smoothed_speed = prev["speed"] * 0.6 + rv.speed * 0.4
         else:
