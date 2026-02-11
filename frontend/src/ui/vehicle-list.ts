@@ -36,11 +36,16 @@ export function renderVehicleList(
       </div>`;
     }).join("");
 
+    const signalTag = v.signal_lost
+      ? `<span style="color:#dc2626;font-size:11px;font-weight:600">Нет сигнала</span>`
+      : "";
+
     card.innerHTML = `
       <div class="vehicle-card-header">
-        <span class="route-badge" style="background:${routeColor(v.route)}">${v.route}</span>
+        <span class="route-badge" style="background:${routeColor(v.route)}${v.signal_lost ? ";opacity:0.4" : ""}">${v.route}</span>
         <span class="vehicle-speed">${v.speed.toFixed(0)} км/ч</span>
         <span class="vehicle-board">#${v.board_num}</span>
+        ${signalTag}
       </div>
       <div class="vehicle-stops">
         ${v.prev_stop ? `<div class="prev-stop-label">от: ${v.prev_stop.name}</div>` : ""}

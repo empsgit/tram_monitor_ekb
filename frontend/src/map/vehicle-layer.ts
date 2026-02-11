@@ -25,14 +25,15 @@ export function routeColor(routeNum: string): string {
   return COLORS[Math.abs(hash) % COLORS.length];
 }
 
-function createIcon(routeNum: string): L.DivIcon {
+function createIcon(routeNum: string, signalLost = false): L.DivIcon {
   const color = routeColor(routeNum);
+  const opacity = signalLost ? "0.4" : "1";
   return L.divIcon({
     className: "",
     iconSize: [32, 32],
     iconAnchor: [16, 16],
     html: `
-      <div class="tram-marker" style="background:${color}">
+      <div class="tram-marker" style="background:${color};opacity:${opacity}">
         <span class="tram-arrow"></span>
         <span class="tram-label">${routeNum}</span>
       </div>
@@ -128,6 +129,7 @@ interface TrackedVehicle {
   marker: L.Marker;
   route: string;
   routeId: number | null;
+  signalLost: boolean;
   // Progress-based animation
   prevProgress: number | null;
   targetProgress: number | null;
@@ -222,14 +224,15 @@ export class VehicleLayer {
         tv.routeId = v.route_id;
         tv.updateTime = now;
 
-        if (tv.route !== v.route) {
-          tv.marker.setIcon(createIcon(v.route));
+        if (tv.route !== v.route || tv.signalLost !== v.signal_lost) {
+          tv.marker.setIcon(createIcon(v.route, v.signal_lost));
           tv.route = v.route;
+          tv.signalLost = v.signal_lost;
         }
         tv.marker.setPopupContent(this.popupHtml(v));
       } else {
         const marker = L.marker([v.lat, v.lon], {
-          icon: createIcon(v.route),
+          icon: createIcon(v.route, v.signal_lost),
           zIndexOffset: 100,
         });
         marker.bindPopup(this.popupHtml(v));
@@ -240,6 +243,7 @@ export class VehicleLayer {
           marker,
           route: v.route,
           routeId: v.route_id,
+          signalLost: v.signal_lost,
           prevProgress: v.progress,
           targetProgress: v.progress,
           prevLat: v.lat,
@@ -446,10 +450,15 @@ export class VehicleLayer {
       })
       .join("");
 
+    const signalBadge = v.signal_lost
+      ? `<div style="margin-top:4px;color:#dc2626;font-weight:600;font-size:11px">Нет сигнала</div>`
+      : "";
+
     return `
       <div style="font-family:sans-serif;font-size:13px;min-width:180px">
         <b>Маршрут ${v.route}</b> <span style="color:#6b7280">(${v.board_num})</span><br/>
         <span style="color:#6b7280">Скорость: ${v.speed.toFixed(0)} км/ч</span>
+        ${signalBadge}
         ${v.prev_stop ? `<div style="margin-top:4px;color:#6b7280">От: ${v.prev_stop.name}</div>` : ""}
         ${stopsHtml ? `<div style="margin-top:4px;border-top:1px solid #e0e0e0;padding-top:4px;font-size:12px">${stopsHtml}</div>` : ""}
       </div>
