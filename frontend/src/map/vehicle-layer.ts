@@ -45,7 +45,14 @@ const INTERP_DURATION = 10000; // ms — matches server poll interval
 const MAX_EXTRAP_MS = 5000;    // ms — extrapolate up to 5s beyond target
 const DEG2RAD = Math.PI / 180;
 const M_PER_DEG_LAT = 111320;
-const MAX_TRAIL_POINTS = 20;
+
+// Max progress change that can be animated (~5% of route).
+// Anything larger is a GPS glitch or direction change — snap instantly.
+const MAX_ANIM_PROGRESS_DELTA = 0.05;
+
+// Trail: ~80m max, fading out
+const TRAIL_MAX_DIST_M = 80;
+const TRAIL_SEGMENT_COUNT = 6; // number of gradient segments
 
 /** Interpolate between two angles via the shortest arc. */
 function lerpAngle(from: number, to: number, t: number): number {
@@ -109,6 +116,14 @@ function bearingAtProgress(geom: RouteGeometry, progress: number): number {
   return (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
 }
 
+/** Distance in meters between two [lat, lon] points. */
+function distM(a: [number, number], b: [number, number]): number {
+  const dlat = (b[0] - a[0]) * M_PER_DEG_LAT;
+  const cosLat = Math.cos(a[0] * DEG2RAD);
+  const dlon = (b[1] - a[1]) * M_PER_DEG_LAT * cosLat;
+  return Math.sqrt(dlat * dlat + dlon * dlon);
+}
+
 interface TrackedVehicle {
   marker: L.Marker;
   route: string;
@@ -136,7 +151,7 @@ interface TrackedVehicle {
 export class VehicleLayer {
   private tracked: Map<string, TrackedVehicle> = new Map();
   private trailPoints: Map<string, [number, number][]> = new Map();
-  private trailLines: Map<string, L.Polyline> = new Map();
+  private trailLines: Map<string, L.Polyline[]> = new Map();
   private layerGroup: L.LayerGroup;
   private trailGroup: L.LayerGroup;
   private rafId: number = 0;
@@ -185,6 +200,19 @@ export class VehicleLayer {
         tv.prevLon = tv.currentLon;
         tv.prevCourse = tv.currentCourse;
         tv.prevProgress = tv.currentProgress;
+
+        // Detect unreasonable progress jumps — snap instead of animating
+        if (
+          tv.prevProgress != null && v.progress != null &&
+          Math.abs(v.progress - tv.prevProgress) > MAX_ANIM_PROGRESS_DELTA
+        ) {
+          // Large jump: teleport to new position immediately
+          tv.prevProgress = v.progress;
+          tv.prevLat = v.lat;
+          tv.prevLon = v.lon;
+          tv.prevCourse = v.course;
+        }
+
         // Set new target
         tv.targetLat = v.lat;
         tv.targetLon = v.lon;
@@ -235,9 +263,9 @@ export class VehicleLayer {
       if (!seen.has(id)) {
         this.layerGroup.removeLayer(tv.marker);
         this.tracked.delete(id);
-        const trail = this.trailLines.get(id);
-        if (trail) {
-          this.trailGroup.removeLayer(trail);
+        const segments = this.trailLines.get(id);
+        if (segments) {
+          for (const seg of segments) this.trailGroup.removeLayer(seg);
           this.trailLines.delete(id);
         }
         this.trailPoints.delete(id);
@@ -330,33 +358,69 @@ export class VehicleLayer {
     }
   }
 
+  /** Update trail: keep points within TRAIL_MAX_DIST_M, render as fading gradient. */
   private updateTrail(v: VehicleData): void {
     const pts = this.trailPoints.get(v.id) || [];
+    const newPt: [number, number] = [v.lat, v.lon];
     const last = pts[pts.length - 1];
-    if (!last || Math.abs(last[0] - v.lat) > 0.00002 || Math.abs(last[1] - v.lon) > 0.00002) {
-      pts.push([v.lat, v.lon]);
-      if (pts.length > MAX_TRAIL_POINTS) pts.shift();
-      this.trailPoints.set(v.id, pts);
+
+    if (!last || distM(last, newPt) > 2) {
+      pts.push(newPt);
     }
 
-    if (pts.length < 2) return;
+    // Trim from the back to stay within max trail distance
+    let totalDist = 0;
+    let keepFrom = pts.length - 1;
+    for (let i = pts.length - 1; i > 0; i--) {
+      totalDist += distM(pts[i - 1], pts[i]);
+      if (totalDist > TRAIL_MAX_DIST_M) {
+        keepFrom = i;
+        break;
+      }
+      keepFrom = i - 1;
+    }
+    const trimmed = pts.slice(keepFrom);
+    this.trailPoints.set(v.id, trimmed);
 
+    // Remove old trail segments
+    const oldSegs = this.trailLines.get(v.id);
+    if (oldSegs) {
+      for (const seg of oldSegs) this.trailGroup.removeLayer(seg);
+    }
+
+    if (trimmed.length < 2) {
+      this.trailLines.delete(v.id);
+      return;
+    }
+
+    // Build gradient trail: split into segments with decreasing opacity
     const color = routeColor(v.route);
-    let polyline = this.trailLines.get(v.id);
-    if (polyline) {
-      polyline.setLatLngs(pts);
-      polyline.setStyle({ color });
-    } else {
-      polyline = L.polyline(pts, {
+    const segments: L.Polyline[] = [];
+    const segCount = Math.min(TRAIL_SEGMENT_COUNT, trimmed.length - 1);
+    const ptsPerSeg = Math.max(1, Math.floor((trimmed.length - 1) / segCount));
+
+    for (let s = 0; s < segCount; s++) {
+      const startIdx = s * ptsPerSeg;
+      const endIdx = s === segCount - 1 ? trimmed.length - 1 : (s + 1) * ptsPerSeg;
+      if (startIdx >= trimmed.length - 1) break;
+
+      const segPts = trimmed.slice(startIdx, endIdx + 1);
+      // Oldest segment (s=0) is most faded; newest (s=segCount-1) is brightest
+      const opacity = 0.15 + 0.55 * ((s + 1) / segCount);
+      const weight = 3 + 2 * ((s + 1) / segCount);
+
+      const polyline = L.polyline(segPts, {
         color,
-        weight: 3,
-        opacity: 0.25,
+        weight,
+        opacity,
         lineCap: "round",
         lineJoin: "round",
       });
       polyline.addTo(this.trailGroup);
-      this.trailLines.set(v.id, polyline);
+      segments.push(polyline);
     }
+
+    this.trailLines.set(v.id, segments);
   }
 
   private updateHeading(marker: L.Marker, course: number): void {
