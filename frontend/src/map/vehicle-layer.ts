@@ -1,7 +1,8 @@
-/** Manages tram vehicle markers with continuous client-side interpolation. */
+/** Manages tram vehicle markers with route-snapped animation. */
 
 import L from "leaflet";
 import type { VehicleData } from "../services/ws-client";
+import type { RouteInfo } from "../services/api-client";
 
 // Maximally distinct color palette (Kelly's colors + extras)
 const COLORS = [
@@ -39,7 +40,7 @@ function createIcon(routeNum: string): L.DivIcon {
   });
 }
 
-// --- Dead-reckoning constants ---
+// --- Animation constants ---
 const INTERP_DURATION = 10000; // ms — matches server poll interval
 const MAX_EXTRAP_MS = 5000;    // ms — extrapolate up to 5s beyond target
 const DEG2RAD = Math.PI / 180;
@@ -52,14 +53,73 @@ function lerpAngle(from: number, to: number, t: number): number {
   return (from + diff * t + 360) % 360;
 }
 
+// --- Pre-computed route geometry for fast progress → [lat,lon] lookup ---
+interface RouteGeometry {
+  points: [number, number][];  // [lat, lon]
+  cumDist: number[];           // cumulative distance (meters) at each vertex
+  totalDist: number;
+}
+
+function buildRouteGeometry(coords: number[][]): RouteGeometry {
+  const points: [number, number][] = coords.map(c => [c[0], c[1]]);
+  const cumDist: number[] = [0];
+  let total = 0;
+  const cosLat = Math.cos((points[0][0]) * DEG2RAD);
+  for (let i = 1; i < points.length; i++) {
+    const dlat = (points[i][0] - points[i - 1][0]) * M_PER_DEG_LAT;
+    const dlon = (points[i][1] - points[i - 1][1]) * M_PER_DEG_LAT * cosLat;
+    total += Math.sqrt(dlat * dlat + dlon * dlon);
+    cumDist.push(total);
+  }
+  return { points, cumDist, totalDist: total };
+}
+
+/** Given a progress 0–1, return [lat, lon] on the route polyline. */
+function pointAtProgress(geom: RouteGeometry, progress: number): [number, number] {
+  const p = Math.max(0, Math.min(1, progress));
+  const targetDist = p * geom.totalDist;
+
+  // Binary search for the segment containing targetDist
+  let lo = 0, hi = geom.cumDist.length - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (geom.cumDist[mid] <= targetDist) lo = mid;
+    else hi = mid;
+  }
+
+  const segStart = geom.cumDist[lo];
+  const segEnd = geom.cumDist[hi];
+  const segLen = segEnd - segStart;
+  const t = segLen > 0 ? (targetDist - segStart) / segLen : 0;
+
+  return [
+    geom.points[lo][0] + (geom.points[hi][0] - geom.points[lo][0]) * t,
+    geom.points[lo][1] + (geom.points[hi][1] - geom.points[lo][1]) * t,
+  ];
+}
+
+/** Compute bearing (degrees) at a progress point on the route. */
+function bearingAtProgress(geom: RouteGeometry, progress: number): number {
+  const eps = 0.001; // ~0.1% of route
+  const p1 = pointAtProgress(geom, Math.max(0, progress - eps));
+  const p2 = pointAtProgress(geom, Math.min(1, progress + eps));
+  const cosLat = Math.cos(p1[0] * DEG2RAD);
+  const dx = (p2[1] - p1[1]) * cosLat;
+  const dy = p2[0] - p1[0];
+  return (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
+}
+
 interface TrackedVehicle {
   marker: L.Marker;
   route: string;
-  // Animated position snapshot when the latest update arrived
+  routeId: number | null;
+  // Progress-based animation
+  prevProgress: number | null;
+  targetProgress: number | null;
+  // Fallback: raw lat/lon for vehicles without route geometry
   prevLat: number;
   prevLon: number;
   prevCourse: number;
-  // Target from the latest server update
   targetLat: number;
   targetLon: number;
   targetCourse: number;
@@ -70,6 +130,7 @@ interface TrackedVehicle {
   currentLat: number;
   currentLon: number;
   currentCourse: number;
+  currentProgress: number | null;
 }
 
 export class VehicleLayer {
@@ -80,10 +141,23 @@ export class VehicleLayer {
   private trailGroup: L.LayerGroup;
   private rafId: number = 0;
 
+  // Route geometry index for progress → position lookup
+  private routeGeometries: Map<number, RouteGeometry> = new Map();
+
   constructor(map: L.Map) {
     this.trailGroup = L.layerGroup().addTo(map);
     this.layerGroup = L.layerGroup().addTo(map);
     this.startAnimation();
+  }
+
+  /** Load route geometries for route-following animation. */
+  loadRoutes(routes: RouteInfo[]): void {
+    this.routeGeometries.clear();
+    for (const route of routes) {
+      if (route.geometry && route.geometry.length >= 2) {
+        this.routeGeometries.set(route.id, buildRouteGeometry(route.geometry));
+      }
+    }
   }
 
   /** Kick off the continuous animation loop. */
@@ -110,11 +184,14 @@ export class VehicleLayer {
         tv.prevLat = tv.currentLat;
         tv.prevLon = tv.currentLon;
         tv.prevCourse = tv.currentCourse;
+        tv.prevProgress = tv.currentProgress;
         // Set new target
         tv.targetLat = v.lat;
         tv.targetLon = v.lon;
         tv.targetCourse = v.course;
         tv.targetSpeed = v.speed;
+        tv.targetProgress = v.progress;
+        tv.routeId = v.route_id;
         tv.updateTime = now;
 
         if (tv.route !== v.route) {
@@ -134,6 +211,9 @@ export class VehicleLayer {
         this.tracked.set(v.id, {
           marker,
           route: v.route,
+          routeId: v.route_id,
+          prevProgress: v.progress,
+          targetProgress: v.progress,
           prevLat: v.lat,
           prevLon: v.lon,
           prevCourse: v.course,
@@ -145,6 +225,7 @@ export class VehicleLayer {
           currentLat: v.lat,
           currentLon: v.lon,
           currentCourse: v.course,
+          currentProgress: v.progress,
         });
       }
     }
@@ -167,10 +248,8 @@ export class VehicleLayer {
   /**
    * Runs every animation frame (~60 fps).
    *
-   * Phase 1 (0 – 10 s): linear interpolation from previous position to server target.
-   * Phase 2 (10 – 15 s): dead-reckoning extrapolation using speed + heading.
-   *
-   * This eliminates the "move-stop-move" pattern completely.
+   * If the vehicle has progress + route geometry, it follows the route polyline.
+   * Otherwise falls back to linear lat/lon interpolation + dead-reckoning.
    */
   private interpolateAll(): void {
     const now = performance.now();
@@ -179,26 +258,59 @@ export class VehicleLayer {
       const elapsed = now - tv.updateTime;
       let lat: number, lon: number, course: number;
 
-      if (elapsed < INTERP_DURATION) {
-        // Smooth interpolation toward server target
-        const t = elapsed / INTERP_DURATION;
-        lat = tv.prevLat + (tv.targetLat - tv.prevLat) * t;
-        lon = tv.prevLon + (tv.targetLon - tv.prevLon) * t;
-        // Heading settles faster (~3 seconds)
-        const ht = Math.min(elapsed / 3000, 1);
-        course = lerpAngle(tv.prevCourse, tv.targetCourse, ht);
-      } else {
-        // Dead reckoning: continue moving based on last known speed + heading
-        const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
-        const extraS = extraMs / 1000;
-        const speedMs = tv.targetSpeed / 3.6;
-        const bearing = tv.targetCourse * DEG2RAD;
-        const dMeters = speedMs * extraS;
-        const cosLat = Math.cos(tv.targetLat * DEG2RAD);
+      // Try route-following mode
+      const geom = tv.routeId != null ? this.routeGeometries.get(tv.routeId) : undefined;
+      const hasRoute = geom && tv.targetProgress != null && tv.prevProgress != null;
 
-        lat = tv.targetLat + (dMeters * Math.cos(bearing)) / M_PER_DEG_LAT;
-        lon = tv.targetLon + (dMeters * Math.sin(bearing)) / (M_PER_DEG_LAT * cosLat);
-        course = tv.targetCourse;
+      if (hasRoute) {
+        // --- Route-following animation ---
+        let progress: number;
+        if (elapsed < INTERP_DURATION) {
+          const t = elapsed / INTERP_DURATION;
+          progress = tv.prevProgress! + (tv.targetProgress! - tv.prevProgress!) * t;
+        } else {
+          // Dead reckoning: advance progress based on speed
+          const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
+          const extraS = extraMs / 1000;
+          const speedMs = tv.targetSpeed / 3.6;
+          const dMeters = speedMs * extraS;
+          const dProgress = geom!.totalDist > 0 ? dMeters / geom!.totalDist : 0;
+          // Direction: if targetProgress >= prevProgress, moving forward
+          const dir = tv.targetProgress! >= tv.prevProgress! ? 1 : -1;
+          progress = tv.targetProgress! + dProgress * dir;
+        }
+        progress = Math.max(0, Math.min(1, progress));
+
+        const pos = pointAtProgress(geom!, progress);
+        lat = pos[0];
+        lon = pos[1];
+        course = bearingAtProgress(geom!, progress);
+        // Reverse direction: flip bearing 180°
+        if (tv.targetProgress! < tv.prevProgress!) {
+          course = (course + 180) % 360;
+        }
+        tv.currentProgress = progress;
+      } else {
+        // --- Fallback: linear lat/lon interpolation ---
+        if (elapsed < INTERP_DURATION) {
+          const t = elapsed / INTERP_DURATION;
+          lat = tv.prevLat + (tv.targetLat - tv.prevLat) * t;
+          lon = tv.prevLon + (tv.targetLon - tv.prevLon) * t;
+          const ht = Math.min(elapsed / 3000, 1);
+          course = lerpAngle(tv.prevCourse, tv.targetCourse, ht);
+        } else {
+          const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
+          const extraS = extraMs / 1000;
+          const speedMs = tv.targetSpeed / 3.6;
+          const bearing = tv.targetCourse * DEG2RAD;
+          const dMeters = speedMs * extraS;
+          const cosLat = Math.cos(tv.targetLat * DEG2RAD);
+
+          lat = tv.targetLat + (dMeters * Math.cos(bearing)) / M_PER_DEG_LAT;
+          lon = tv.targetLon + (dMeters * Math.sin(bearing)) / (M_PER_DEG_LAT * cosLat);
+          course = tv.targetCourse;
+        }
+        tv.currentProgress = tv.targetProgress;
       }
 
       // Only touch the DOM when the value actually changed

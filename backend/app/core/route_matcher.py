@@ -75,6 +75,14 @@ class RouteMatcher:
             return 0.0
         return self._routes[route_id][1]
 
+    def interpolate_progress(self, route_id: int, progress: float) -> tuple[float, float] | None:
+        """Return (lat, lon) at given progress (0.0–1.0) along the route."""
+        if route_id not in self._routes:
+            return None
+        line, _ = self._routes[route_id]
+        pt = line.interpolate(max(0.0, min(1.0, progress)), normalized=True)
+        return (pt.y, pt.x)  # (lat, lon)
+
     def _infer_direction(self, line: LineString, progress: float, course: float) -> int:
         """Compare vehicle heading with route bearing to infer direction."""
         if progress < 0.01 or progress > 0.99:
