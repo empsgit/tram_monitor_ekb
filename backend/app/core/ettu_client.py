@@ -129,6 +129,16 @@ class EttuClient:
         logger.info("Fetched %d active trams from ETTU", len(vehicles))
         return vehicles
 
+    @staticmethod
+    def _extract_stop_id(item) -> int | None:
+        """Extract stop ID from various formats: int, str, or dict with id/ID."""
+        if isinstance(item, dict):
+            raw = item.get("id", item.get("ID"))
+            if raw is not None:
+                return int(raw)
+            return None
+        return int(item)
+
     async def fetch_routes(self) -> list[RawRoute]:
         """Fetch tram route data."""
         routes = []
@@ -158,11 +168,21 @@ class EttuClient:
                         # path has major stops only (for clean geometry)
                         full_path = elem.get("full_path", elem.get("path", []))
                         geom_path = elem.get("path", full_path)
+                        # Also check for element-level 'stops' as alternative source
+                        if not full_path:
+                            elem_stops = elem.get("stops", elem.get("stations", []))
+                            if isinstance(elem_stops, list):
+                                full_path = elem_stops
+                                if not geom_path:
+                                    geom_path = elem_stops
                         if isinstance(full_path, list):
-                            for order, stop_id_str in enumerate(full_path):
+                            for order, stop_item in enumerate(full_path):
                                 try:
+                                    sid = self._extract_stop_id(stop_item)
+                                    if sid is None:
+                                        continue
                                     route.stops.append({
-                                        "id": int(stop_id_str),
+                                        "id": sid,
                                         "name": "",
                                         "lat": 0.0,
                                         "lon": 0.0,
@@ -172,10 +192,13 @@ class EttuClient:
                                 except (ValueError, TypeError):
                                     continue
                         if isinstance(geom_path, list):
-                            for order, stop_id_str in enumerate(geom_path):
+                            for order, stop_item in enumerate(geom_path):
                                 try:
+                                    sid = self._extract_stop_id(stop_item)
+                                    if sid is None:
+                                        continue
                                     route.geometry_stops.append({
-                                        "id": int(stop_id_str),
+                                        "id": sid,
                                         "name": "",
                                         "lat": 0.0,
                                         "lon": 0.0,
@@ -184,6 +207,37 @@ class EttuClient:
                                     })
                                 except (ValueError, TypeError):
                                     continue
+
+                # Fallback: route-level stops/stations if elements yielded nothing
+                if not route.stops:
+                    route_stops = item.get("stops", item.get("stations", []))
+                    if isinstance(route_stops, list):
+                        for order, stop_item in enumerate(route_stops):
+                            try:
+                                sid = self._extract_stop_id(stop_item)
+                                if sid is None:
+                                    continue
+                                direction = 0
+                                if isinstance(stop_item, dict):
+                                    direction = int(stop_item.get("direction", stop_item.get("ind", 0)))
+                                route.stops.append({
+                                    "id": sid,
+                                    "name": "",
+                                    "lat": 0.0,
+                                    "lon": 0.0,
+                                    "order": order,
+                                    "direction": direction,
+                                })
+                            except (ValueError, TypeError):
+                                continue
+
+                if not route.stops:
+                    logger.warning(
+                        "Route %s (%s): 0 stops parsed. keys=%s, elements_count=%d",
+                        route.number, route.name,
+                        list(item.keys()),
+                        len(elements) if isinstance(elements, list) else -1,
+                    )
 
                 routes.append(route)
         except Exception:
