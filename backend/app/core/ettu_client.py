@@ -52,6 +52,7 @@ class EttuClient:
             base_url=settings.ettu_base_url,
             timeout=15.0,
             headers={"Accept": "application/json"},
+            verify=False,
         )
 
     async def close(self) -> None:
