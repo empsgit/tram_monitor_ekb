@@ -64,6 +64,7 @@ class EttuClient:
             resp = await self._client.get("/api/v2/tram/boards/")
             resp.raise_for_status()
             data = resp.json()
+            logger.info("DEBUG boards response type=%s sample=%s", type(data).__name__, str(data)[:500])
         except httpx.HTTPStatusError:
             # Fallback: try trolleybus endpoint and filter by layer
             try:
@@ -112,6 +113,7 @@ class EttuClient:
             resp = await self._client.get("/api/v2/tram/routes/")
             resp.raise_for_status()
             data = resp.json()
+            logger.info("DEBUG routes response type=%s sample=%s", type(data).__name__, str(data)[:500])
 
             items = data if isinstance(data, list) else data.get("routes", [])
             for item in items:
@@ -160,6 +162,7 @@ class EttuClient:
             resp = await self._client.get("/api/v2/tram/stops/")
             resp.raise_for_status()
             data = resp.json()
+            logger.info("DEBUG stops response type=%s sample=%s", type(data).__name__, str(data)[:500])
 
             items = data if isinstance(data, list) else data.get("stops", [])
             for item in items:
