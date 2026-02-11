@@ -41,9 +41,11 @@ class Store {
   }
 
   updateVehicles(vehicles: VehicleData[]): void {
+    const fresh = new Map<string, VehicleData>();
     for (const v of vehicles) {
-      this.state.vehicles.set(v.id, v);
+      fresh.set(v.id, v);
     }
+    this.state.vehicles = fresh;
     this.notify();
   }
 

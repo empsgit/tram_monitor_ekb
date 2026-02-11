@@ -257,8 +257,6 @@ class VehicleTracker:
         """Single poll cycle: fetch positions, process, publish (including ghost vehicles)."""
         try:
             raw_vehicles = await self.ettu.fetch_vehicles()
-            if not raw_vehicles:
-                return
 
             now = datetime.datetime.now(datetime.timezone.utc)
             current_ids: set[str] = set()
@@ -299,9 +297,10 @@ class VehicleTracker:
             vehicles_data = [s.model_dump() for s in states]
             await self.broadcaster.publish(vehicles_data)
 
-            # Persist positions and travel times
-            await self._persist_positions(raw_vehicles)
-            await self._persist_travel_times()
+            # Persist positions and travel times (only if we got data)
+            if raw_vehicles:
+                await self._persist_positions(raw_vehicles)
+                await self._persist_travel_times()
 
         except Exception:
             logger.exception("Error in vehicle poll cycle")
