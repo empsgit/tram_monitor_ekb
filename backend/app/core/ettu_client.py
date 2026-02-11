@@ -153,7 +153,7 @@ class EttuClient:
                 if isinstance(elements, list):
                     for elem in elements:
                         direction = int(elem.get("ind", 0))
-                        path = elem.get("path", [])
+                        path = elem.get("full_path", elem.get("path", []))
                         if isinstance(path, list):
                             for order, stop_id_str in enumerate(path):
                                 try:
