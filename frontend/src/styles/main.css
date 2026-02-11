@@ -2,17 +2,17 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg: #1a1a2e;
-  --bg-panel: #16213e;
-  --bg-card: #1a1a3e;
-  --text: #e0e0e0;
-  --text-muted: #8892a4;
+  --bg: #f5f5f5;
+  --bg-panel: #ffffff;
+  --bg-card: #f0f2f5;
+  --text: #1a1a2e;
+  --text-muted: #6b7280;
   --accent: #e94560;
-  --accent-green: #4ade80;
-  --accent-blue: #60a5fa;
-  --border: #2a2a4a;
+  --accent-green: #16a34a;
+  --accent-blue: #2563eb;
+  --border: #e0e0e0;
   --radius: 10px;
-  --shadow: 0 4px 24px rgba(0,0,0,0.3);
+  --shadow: 0 4px 24px rgba(0,0,0,0.08);
   --panel-width: 380px;
 }
 
@@ -283,8 +283,8 @@ html, body {
   color: white;
   font-size: 10px;
   font-weight: 800;
-  border: 2px solid white;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  border: 2px solid rgba(0,0,0,0.2);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25);
   transform-origin: center;
   transition: transform 0.3s;
 }
@@ -296,7 +296,7 @@ html, body {
   height: 0;
   border-left: 4px solid transparent;
   border-right: 4px solid transparent;
-  border-bottom: 6px solid white;
+  border-bottom: 6px solid rgba(0,0,0,0.3);
 }
 
 .stop-marker {
