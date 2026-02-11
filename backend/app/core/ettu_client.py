@@ -210,12 +210,12 @@ class EttuClient:
                     stop_id = int(item.get("ID", item.get("id", 0)))
                     if stop_id == 0:
                         continue
-                    name = str(item.get("NAME", item.get("name", ""))).strip()
+                    name = str(item.get("NAME") or item.get("name") or "").strip()
                     lat = float(item.get("LAT", item.get("lat", 0)))
                     lon = float(item.get("LON", item.get("lon", item.get("lng", 0))))
                     if lat == 0 or lon == 0:
                         continue
-                    direction = str(item.get("DIRECTION", item.get("direction", ""))).strip()
+                    direction = str(item.get("DIRECTION") or item.get("direction") or "").strip()
                     stops.append(RawStop(id=stop_id, name=name, lat=lat, lon=lon, direction=direction))
                 except (ValueError, TypeError):
                     continue
