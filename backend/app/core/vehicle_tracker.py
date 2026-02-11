@@ -70,6 +70,9 @@ class VehicleTracker:
         # stop_id -> (lat, lon) for distance calculations
         self._stop_coords: dict[int, tuple[float, float]] = {}
 
+        # stop_id -> direction label
+        self._stop_directions: dict[int, str] = {}
+
         # Current vehicle states (vehicle_id -> VehicleState)
         self.current_states: dict[str, VehicleState] = {}
 
@@ -324,8 +327,24 @@ class VehicleTracker:
     async def _persist_routes_stops(
         self, routes: list[RawRoute], stops: list[RawStop]
     ) -> None:
-        """Upsert routes and stops to database."""
-        # Phase 1: persist named stops and routes
+        """Upsert routes and stops to database (each in its own transaction)."""
+        # Phase 1a: persist routes
+        try:
+            async with self.session_factory() as session:
+                for r in routes:
+                    await session.execute(
+                        text("""
+                            INSERT INTO routes (id, number, name, color)
+                            VALUES (:id, :number, :name, :color)
+                            ON CONFLICT (id) DO UPDATE SET number=:number, name=:name
+                        """),
+                        {"id": r.id, "number": r.number, "name": r.name, "color": "#e53935"},
+                    )
+                await session.commit()
+        except Exception:
+            logger.exception("Failed to persist routes to database")
+
+        # Phase 1b: persist named stops
         try:
             async with self.session_factory() as session:
                 for s in stops:
@@ -339,21 +358,9 @@ class VehicleTracker:
                         """),
                         {"id": s.id, "name": s.name, "direction": s.direction, "lat": s.lat, "lon": s.lon},
                     )
-
-                for r in routes:
-                    await session.execute(
-                        text("""
-                            INSERT INTO routes (id, number, name, color)
-                            VALUES (:id, :number, :name, :color)
-                            ON CONFLICT (id) DO UPDATE SET number=:number, name=:name
-                        """),
-                        {"id": r.id, "number": r.number, "name": r.name, "color": "#e53935"},
-                    )
-
                 await session.commit()
         except Exception:
-            logger.exception("Failed to persist routes/stops to database")
-            return
+            logger.exception("Failed to persist stops to database")
 
         # Phase 2: persist route_stops (only for stops that are in DB)
         if not stops:

@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from sqlalchemy import text
+
 from app.api import diagnostics, routes, stops, vehicles, ws
 from app.core.broadcaster import Broadcaster
 from app.core.ettu_client import EttuClient
@@ -28,6 +30,10 @@ async def lifespan(app: FastAPI):
     # Create tables if they don't exist
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Migrate: add direction column to stops if missing (existing DBs)
+        await conn.execute(
+            text("ALTER TABLE stops ADD COLUMN IF NOT EXISTS direction VARCHAR(255) NOT NULL DEFAULT ''")
+        )
 
     # Initialize services
     ettu = EttuClient()

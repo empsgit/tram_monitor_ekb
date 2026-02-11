@@ -49,16 +49,21 @@ async function main() {
     panel.classList.toggle("expanded");
   });
 
-  // Load routes and stops from API
+  // Load routes and stops independently (one failure shouldn't block the other)
   try {
-    const [routes, stops] = await Promise.all([getRoutes(), getStops()]);
+    const routes = await getRoutes();
     store.setRoutes(routes);
-    store.setStops(stops);
-    stopLayer.loadStops(stops);
     routeLayer.loadRoutes(routes);
     renderRouteFilter(routeFilterEl, routes);
   } catch (e) {
-    console.error("Failed to load initial data:", e);
+    console.error("Failed to load routes:", e);
+  }
+  try {
+    const stops = await getStops();
+    store.setStops(stops);
+    stopLayer.loadStops(stops);
+  } catch (e) {
+    console.error("Failed to load stops:", e);
   }
 
   // Set up stop search
