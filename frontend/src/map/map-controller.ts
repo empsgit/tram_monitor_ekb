@@ -13,7 +13,7 @@ export function initMap(): L.Map {
     center: EKB_CENTER,
     zoom: DEFAULT_ZOOM,
     zoomControl: true,
-    attributionControl: true,
+    attributionControl: false,
   });
 
   // Light-themed tiles (CartoDB Positron)
