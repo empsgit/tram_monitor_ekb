@@ -1,5 +1,6 @@
 """Async client for the ETTU (Gortrans) API at map.ettu.ru."""
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 
@@ -11,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 # ETTU API layer identifiers
 LAYER_TRAM = 0
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_BACKOFF = [2, 4, 8]  # seconds between retries
 
 
 @dataclass
@@ -51,7 +56,7 @@ class EttuClient:
     def __init__(self) -> None:
         self._client = httpx.AsyncClient(
             base_url=settings.ettu_base_url,
-            timeout=15.0,
+            timeout=30.0,
             headers={"Accept": "application/json"},
             params={"apiKey": "111"},
             verify=False,
@@ -60,24 +65,39 @@ class EttuClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def _get_with_retry(self, path: str, label: str) -> httpx.Response | None:
+        """GET request with retry and exponential backoff."""
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                resp = await self._client.get(path)
+                resp.raise_for_status()
+                return resp
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as e:
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_BACKOFF[attempt]
+                    logger.warning(
+                        "%s attempt %d/%d failed (%s), retrying in %ds",
+                        label, attempt + 1, MAX_RETRIES + 1, type(e).__name__, wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error("%s failed after %d attempts: %s", label, MAX_RETRIES + 1, e)
+                    return None
+            except Exception:
+                logger.exception("Failed to fetch %s from ETTU", label)
+                return None
+        return None
+
     async def fetch_vehicles(self) -> list[RawVehicle]:
         """Fetch all current tram positions."""
+        resp = await self._get_with_retry("/api/v2/tram/boards/", "vehicles")
+        if resp is None:
+            return []
         try:
-            resp = await self._client.get("/api/v2/tram/boards/")
-            resp.raise_for_status()
             data = resp.json()
             logger.debug("Boards response keys=%s count=%d", list(data.keys()) if isinstance(data, dict) else "list", len(data if isinstance(data, list) else data.get("vehicles", [])))
-        except httpx.HTTPStatusError:
-            # Fallback: try trolleybus endpoint and filter by layer
-            try:
-                resp = await self._client.get("/api/v2/troll/boards/")
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception:
-                logger.exception("Failed to fetch vehicles from ETTU")
-                return []
         except Exception:
-            logger.exception("Failed to fetch vehicles from ETTU")
+            logger.exception("Failed to parse vehicles response from ETTU")
             return []
 
         vehicles = []
@@ -111,9 +131,12 @@ class EttuClient:
     async def fetch_routes(self) -> list[RawRoute]:
         """Fetch tram route data."""
         routes = []
+        resp = await self._get_with_retry("/api/v2/tram/routes/", "routes")
+        if resp is None:
+            logger.info("Fetched 0 tram routes from ETTU")
+            return routes
+
         try:
-            resp = await self._client.get("/api/v2/tram/routes/")
-            resp.raise_for_status()
             data = resp.json()
             logger.debug("Routes response keys=%s count=%d", list(data.keys()) if isinstance(data, dict) else "list", len(data if isinstance(data, list) else data.get("routes", [])))
 
@@ -147,7 +170,7 @@ class EttuClient:
 
                 routes.append(route)
         except Exception:
-            logger.exception("Failed to fetch routes from ETTU")
+            logger.exception("Failed to parse routes from ETTU")
 
         logger.info("Fetched %d tram routes from ETTU", len(routes))
         return routes
@@ -155,9 +178,12 @@ class EttuClient:
     async def fetch_stops(self) -> list[RawStop]:
         """Fetch all tram stops."""
         stops = []
+        resp = await self._get_with_retry("/api/v2/tram/points/", "stops")
+        if resp is None:
+            logger.info("Fetched 0 tram stops from ETTU")
+            return stops
+
         try:
-            resp = await self._client.get("/api/v2/tram/points/")
-            resp.raise_for_status()
             data = resp.json()
             items = data if isinstance(data, list) else (
                 data.get("points", data.get("stops", data.get("stations", [])))
@@ -177,7 +203,7 @@ class EttuClient:
                 except (ValueError, TypeError):
                     continue
         except Exception:
-            logger.exception("Failed to fetch stops from ETTU")
+            logger.exception("Failed to parse stops from ETTU")
 
         logger.info("Fetched %d tram stops from ETTU", len(stops))
         return stops

@@ -1,5 +1,6 @@
 """FastAPI application entry point."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -50,11 +51,23 @@ async def lifespan(app: FastAPI):
     routes.tracker = tracker
     diagnostics.tracker = tracker
 
-    # Load initial routes and stops
-    try:
-        await tracker.load_routes_and_stops()
-    except Exception:
-        logger.exception("Failed to load initial routes/stops - will retry")
+    # Load initial routes and stops (retry up to 3 times on failure)
+    loaded = False
+    for attempt in range(3):
+        try:
+            await tracker.load_routes_and_stops()
+            if tracker._route_num_to_id:
+                loaded = True
+                break
+            else:
+                logger.warning("Initial load returned 0 routes (attempt %d/3), retrying in 10s", attempt + 1)
+                await asyncio.sleep(10)
+        except Exception:
+            logger.exception("Failed to load routes/stops (attempt %d/3), retrying in 10s", attempt + 1)
+            await asyncio.sleep(10)
+
+    if not loaded:
+        logger.error("Could not load routes after 3 attempts - will keep retrying via scheduler")
 
     # Start scheduler
     scheduler = create_scheduler(tracker)
