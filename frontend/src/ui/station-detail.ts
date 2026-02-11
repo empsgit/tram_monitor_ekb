@@ -10,6 +10,10 @@ function formatEta(seconds: number | null | undefined): string {
   return `${Math.ceil(seconds / 60)} мин`;
 }
 
+function stopDisplayName(stop: StopInfo): string {
+  return stop.direction ? `${stop.name} (${stop.direction})` : stop.name;
+}
+
 export function renderStopSearch(
   searchInput: HTMLInputElement,
   container: HTMLElement
@@ -22,17 +26,19 @@ export function renderStopSearch(
     }
 
     const matches = store.state.stops.filter((s) =>
-      s.name.toLowerCase().includes(q)
+      s.name.toLowerCase().includes(q) ||
+      (s.direction && s.direction.toLowerCase().includes(q))
     );
 
     container.innerHTML = "";
     for (const stop of matches.slice(0, 15)) {
+      const displayName = stopDisplayName(stop);
       const el = document.createElement("div");
       el.className = "stop-result";
-      el.textContent = stop.name;
+      el.textContent = displayName;
       el.addEventListener("click", () => {
         store.selectStop(stop.id);
-        searchInput.value = stop.name;
+        searchInput.value = displayName;
         flyTo(stop.lat, stop.lon, 16);
         renderStationDetail(container, stop);
       });
@@ -46,7 +52,7 @@ export async function renderStationDetail(
   stop: StopInfo
 ): Promise<void> {
   container.innerHTML = `
-    <div class="station-name">${stop.name}</div>
+    <div class="station-name">${stopDisplayName(stop)}</div>
     <div style="color:var(--text-muted);padding:12px">Загрузка...</div>
   `;
 
@@ -54,13 +60,13 @@ export async function renderStationDetail(
     const data = await getStopArrivals(stop.id);
     if (data.arrivals.length === 0) {
       container.innerHTML = `
-        <div class="station-name">${stop.name}</div>
+        <div class="station-name">${stopDisplayName(stop)}</div>
         <div style="color:var(--text-muted);padding:12px;text-align:center">Нет ближайших трамваев</div>
       `;
       return;
     }
 
-    let html = `<div class="station-name">${stop.name}</div>`;
+    let html = `<div class="station-name">${stopDisplayName(stop)}</div>`;
     for (const a of data.arrivals) {
       html += `
         <div class="arrival-row">
@@ -75,7 +81,7 @@ export async function renderStationDetail(
     container.innerHTML = html;
   } catch {
     container.innerHTML = `
-      <div class="station-name">${stop.name}</div>
+      <div class="station-name">${stopDisplayName(stop)}</div>
       <div style="color:var(--accent);padding:12px">Ошибка загрузки</div>
     `;
   }

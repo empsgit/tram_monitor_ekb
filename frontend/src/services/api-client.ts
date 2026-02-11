@@ -12,6 +12,7 @@ export interface RouteInfo {
 export interface StopInfo {
   id: number;
   name: string;
+  direction: string;
   lat: number;
   lon: number;
 }

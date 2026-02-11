@@ -20,6 +20,13 @@ logger = logging.getLogger(__name__)
 OSRM_BASE = "https://router.project-osrm.org"
 
 
+def _stop_display_name(name: str, direction: str) -> str:
+    """Combine stop name with direction label, e.g. '1-й км (на Пионерскую)'."""
+    if direction:
+        return f"{name} ({direction})"
+    return name
+
+
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Distance in meters between two lat/lon points."""
     R = 6_371_000
@@ -66,6 +73,10 @@ class VehicleTracker:
         # Current vehicle states (vehicle_id -> VehicleState)
         self.current_states: dict[str, VehicleState] = {}
 
+        # Diagnostics: track unresolved stop IDs per route
+        self._diag_unresolved: dict[int, list[int]] = {}  # route_id -> [stop_ids not in points]
+        self._diag_total_path_stops: dict[int, int] = {}  # route_id -> total path entries
+
     async def load_routes_and_stops(self) -> None:
         """Fetch and load routes and stops from ETTU API into matchers."""
         routes = await self.ettu.fetch_routes()
@@ -74,9 +85,12 @@ class VehicleTracker:
         # Build stop lookup from ALL stops (including unnamed) for route resolution
         stop_lookup: dict[int, RawStop] = {s.id: s for s in stops}
 
-        # Cache stop coordinates
+        # Cache stop coordinates and direction labels
+        self._stop_directions: dict[int, str] = {}
         for s in stops:
             self._stop_coords[s.id] = (s.lat, s.lon)
+            if s.direction:
+                self._stop_directions[s.id] = s.direction
 
         for route in routes:
             self._route_num_to_id[route.number] = route.id
@@ -84,14 +98,26 @@ class VehicleTracker:
 
             # Resolve stop coordinates from the global stop list
             resolved_stops = []
+            unresolved_ids = []
+            total_path = len(route.stops)
             for s in route.stops:
                 stop_info = stop_lookup.get(s["id"])
                 if stop_info:
                     s["name"] = stop_info.name
+                    s["direction_label"] = stop_info.direction
                     s["lat"] = stop_info.lat
                     s["lon"] = stop_info.lon
                     resolved_stops.append(s)
+                else:
+                    unresolved_ids.append(s["id"])
             route.stops = resolved_stops
+            self._diag_total_path_stops[route.id] = total_path
+            if unresolved_ids:
+                self._diag_unresolved[route.id] = unresolved_ids
+                logger.warning(
+                    "Route %s (%s): %d/%d stops unresolved: %s",
+                    route.number, route.name, len(unresolved_ids), total_path, unresolved_ids[:10],
+                )
 
             # Build stop-route association
             named_ids = set()
@@ -132,7 +158,7 @@ class VehicleTracker:
 
                 route_stops.append(StopOnRoute(
                     stop_id=s["id"],
-                    name=s["name"],
+                    name=_stop_display_name(s["name"], s.get("direction_label", "")),
                     lat=s["lat"],
                     lon=s["lon"],
                     order=s["order"],
@@ -307,11 +333,11 @@ class VehicleTracker:
                         continue
                     await session.execute(
                         text("""
-                            INSERT INTO stops (id, name, lat, lon)
-                            VALUES (:id, :name, :lat, :lon)
-                            ON CONFLICT (id) DO UPDATE SET name=:name, lat=:lat, lon=:lon
+                            INSERT INTO stops (id, name, direction, lat, lon)
+                            VALUES (:id, :name, :direction, :lat, :lon)
+                            ON CONFLICT (id) DO UPDATE SET name=:name, direction=:direction, lat=:lat, lon=:lon
                         """),
-                        {"id": s.id, "name": s.name, "lat": s.lat, "lon": s.lon},
+                        {"id": s.id, "name": s.name, "direction": s.direction, "lat": s.lat, "lon": s.lon},
                     )
 
                 for r in routes:
@@ -356,6 +382,57 @@ class VehicleTracker:
                 await session.commit()
         except Exception:
             logger.exception("Failed to persist route_stops to database")
+
+    def get_diagnostics(self) -> dict:
+        """Get pipeline diagnostics for debugging route-stop resolution."""
+        route_diags = []
+        for route_id, route_num in self._route_id_to_num.items():
+            total = self._diag_total_path_stops.get(route_id, 0)
+            unresolved = self._diag_unresolved.get(route_id, [])
+            resolved = total - len(unresolved)
+            named = len(self._route_stop_ids.get(route_id, []))
+            has_geometry = route_id in self._route_geometries
+            geom_points = len(self._route_geometries.get(route_id, []))
+            route_len = self.route_matcher.get_total_length(route_id)
+
+            # Get stops loaded in detector
+            detector_stops = self.stop_detector.get_all_stops(route_id)
+            stops_by_dir: dict[int, list[dict]] = {}
+            for s in detector_stops:
+                stops_by_dir.setdefault(s.direction, []).append({
+                    "id": s.stop_id,
+                    "name": s.name,
+                    "order": s.order,
+                    "distance_along_m": round(s.distance_along, 1),
+                })
+
+            route_diags.append({
+                "route_id": route_id,
+                "route_number": route_num,
+                "path_stop_count": total,
+                "resolved_count": resolved,
+                "named_count": named,
+                "unresolved_ids": unresolved,
+                "has_osrm_geometry": has_geometry,
+                "geometry_points": geom_points,
+                "route_length_m": round(route_len, 1),
+                "stops_by_direction": {
+                    str(d): sl for d, sl in sorted(stops_by_dir.items())
+                },
+            })
+
+        # Count vehicles with/without route match
+        matched = sum(1 for v in self.current_states.values() if v.progress is not None)
+        total_vehicles = len(self.current_states)
+
+        return {
+            "total_stops_in_points_api": len(self._stop_coords),
+            "total_routes": len(self._route_id_to_num),
+            "total_vehicles": total_vehicles,
+            "vehicles_matched_to_route": matched,
+            "vehicles_unmatched": total_vehicles - matched,
+            "routes": sorted(route_diags, key=lambda r: r["route_number"]),
+        }
 
     def get_vehicles_for_stop(
         self, stop_id: int, route_filter: int | None = None

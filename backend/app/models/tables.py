@@ -34,6 +34,7 @@ class Stop(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    direction: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     lat: Mapped[float] = mapped_column(Float, nullable=False)
     lon: Mapped[float] = mapped_column(Float, nullable=False)
     geometry = mapped_column(Geometry("POINT", srid=4326), nullable=True)

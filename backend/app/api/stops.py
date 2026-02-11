@@ -20,7 +20,7 @@ async def list_stops(session: AsyncSession = Depends(get_session)):
     """Get all tram stops."""
     result = await session.execute(select(Stop).order_by(Stop.name))
     stops = result.scalars().all()
-    return [StopInfoFull(id=s.id, name=s.name, lat=s.lat, lon=s.lon) for s in stops]
+    return [StopInfoFull(id=s.id, name=s.name, direction=s.direction, lat=s.lat, lon=s.lon) for s in stops]
 
 
 @router.get("/{stop_id}/arrivals", response_model=StopArrivals)

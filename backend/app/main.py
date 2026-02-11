@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import routes, stops, vehicles, ws
+from app.api import diagnostics, routes, stops, vehicles, ws
 from app.core.broadcaster import Broadcaster
 from app.core.ettu_client import EttuClient
 from app.core.scheduler import create_scheduler
@@ -42,6 +42,7 @@ async def lifespan(app: FastAPI):
     vehicles.tracker = tracker
     stops.tracker = tracker
     routes.tracker = tracker
+    diagnostics.tracker = tracker
 
     # Load initial routes and stops
     try:
@@ -80,6 +81,7 @@ app.add_middleware(
 app.include_router(routes.router)
 app.include_router(stops.router)
 app.include_router(vehicles.router)
+app.include_router(diagnostics.router)
 app.include_router(ws.router)
 
 
