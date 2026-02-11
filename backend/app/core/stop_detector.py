@@ -2,9 +2,14 @@
 
 import bisect
 import logging
+import math
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+# Approximate meters per degree at Yekaterinburg latitude (~56.8)
+_LAT_M = 111_320.0
+_LON_M = 111_320.0 * math.cos(math.radians(56.84))
 
 
 @dataclass
@@ -68,6 +73,37 @@ class StopDetector:
 
         prev_stop = dir_stops[idx - 1] if idx > 0 else None
         next_stops = dir_stops[idx: idx + max_next]
+
+        return DetectionResult(prev_stop=prev_stop, next_stops=next_stops)
+
+    def detect_by_position(
+        self, route_id: int, lat: float, lon: float, max_next: int = 3
+    ) -> DetectionResult:
+        """Fallback: find nearest stop by GPS distance when route matching fails."""
+        if route_id not in self._stops:
+            return DetectionResult(prev_stop=None, next_stops=[])
+
+        # Try both directions, pick the one with closest stop
+        best_dir = None
+        best_idx = 0
+        best_dist = float("inf")
+
+        for d, stops in self._stops[route_id].items():
+            for i, s in enumerate(stops):
+                dlat = (s.lat - lat) * _LAT_M
+                dlon = (s.lon - lon) * _LON_M
+                dist = dlat * dlat + dlon * dlon  # squared, no need for sqrt
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = i
+                    best_dir = d
+
+        if best_dir is None:
+            return DetectionResult(prev_stop=None, next_stops=[])
+
+        dir_stops = self._stops[route_id][best_dir]
+        prev_stop = dir_stops[best_idx] if best_idx >= 0 else None
+        next_stops = dir_stops[best_idx + 1: best_idx + 1 + max_next]
 
         return DetectionResult(prev_stop=prev_stop, next_stops=next_stops)
 

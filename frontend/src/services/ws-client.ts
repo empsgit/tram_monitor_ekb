@@ -13,6 +13,7 @@ export interface VehicleData {
   next_stops: Array<{ id: number; name: string; eta_seconds: number | null }>;
   progress: number | null;
   timestamp: string | null;
+  signal_lost: boolean;
 }
 
 export interface WsMessage {

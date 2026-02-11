@@ -97,6 +97,9 @@ class VehicleTracker:
         # Batch of travel time observations to persist
         self._travel_time_batch: list[dict] = []
 
+        # Ghost vehicle tracking: vehicle_id -> last seen UTC timestamp
+        self._last_seen: dict[str, datetime.datetime] = {}
+
         # Diagnostics: track unresolved stop IDs per route
         self._diag_unresolved: dict[int, list[int]] = {}  # route_id -> [stop_ids not in points]
         self._diag_total_path_stops: dict[int, int] = {}  # route_id -> total path entries
@@ -247,23 +250,52 @@ class VehicleTracker:
         """Get named stop IDs for a route."""
         return self._route_stop_ids.get(route_id, [])
 
+    # How long to keep a vehicle on the map after it disappears from API
+    GHOST_TTL_SECONDS = 120  # 2 minutes
+
     async def poll_vehicles(self) -> None:
-        """Single poll cycle: fetch positions, process, publish."""
+        """Single poll cycle: fetch positions, process, publish (including ghost vehicles)."""
         try:
             raw_vehicles = await self.ettu.fetch_vehicles()
             if not raw_vehicles:
                 return
 
-            states = []
             now = datetime.datetime.now(datetime.timezone.utc)
+            current_ids: set[str] = set()
+            states = []
+
             for rv in raw_vehicles:
                 state = self._process_vehicle(rv)
                 if state:
+                    state.signal_lost = False
                     states.append(state)
                     self.current_states[state.id] = state
+                    self._last_seen[state.id] = now
+                    current_ids.add(state.id)
                     self._record_stop_passage(state, now)
 
-            # Publish to subscribers
+            # Add ghost vehicles: recently seen but absent from current API response
+            expired = []
+            for vid, last_seen in self._last_seen.items():
+                if vid in current_ids:
+                    continue
+                age = (now - last_seen).total_seconds()
+                if age <= self.GHOST_TTL_SECONDS:
+                    ghost = self.current_states.get(vid)
+                    if ghost:
+                        ghost.signal_lost = True
+                        ghost.speed = 0
+                        states.append(ghost)
+                else:
+                    expired.append(vid)
+                    self.current_states.pop(vid, None)
+                    self._smooth.pop(vid, None)
+                    self._recent_positions.pop(vid, None)
+
+            for vid in expired:
+                del self._last_seen[vid]
+
+            # Publish all vehicles (live + ghosts) to subscribers
             vehicles_data = [s.model_dump() for s in states]
             await self.broadcaster.publish(vehicles_data)
 
@@ -318,6 +350,20 @@ class VehicleTracker:
         if not match:
             # Clear stale smoothing if vehicle can't be matched
             self._smooth.pop(rv.dev_id, None)
+            # Fallback: find nearest stops by GPS distance (no ETA without route match)
+            detection = self.stop_detector.detect_by_position(
+                route_id, rv.lat, rv.lon, max_next=5
+            )
+            if detection.prev_stop:
+                state.prev_stop = StopInfo(
+                    id=detection.prev_stop.stop_id,
+                    name=detection.prev_stop.name,
+                )
+            if detection.next_stops:
+                state.next_stops = [
+                    NextStopInfo(id=s.stop_id, name=s.name, eta_seconds=None)
+                    for s in detection.next_stops
+                ]
             return state
 
         raw_progress = match.progress
@@ -585,6 +631,10 @@ out geom;
         except Exception:
             logger.exception("Failed to update cache timestamp for %s", cache_key)
 
+    # Ekaterinburg is UTC+5; skip travel time recording during night (no trams running)
+    _EKB_UTC_OFFSET = 5
+    _NIGHT_HOURS = range(0, 5)  # 00:00–04:59 local = no service
+
     def _record_stop_passage(self, state: VehicleState, now: datetime.datetime) -> None:
         """Track when a vehicle passes a stop; record travel time between consecutive stops."""
         if not state.prev_stop or not state.route_id:
@@ -597,22 +647,27 @@ out geom;
             elapsed = (now - prev["time"]).total_seconds()
             # Sanity: only record if 10s < elapsed < 30min (filters GPS glitches)
             if 10 < elapsed < 1800:
-                dow = now.weekday()
-                if dow < 5:
-                    day_type = "weekday"
-                elif dow == 5:
-                    day_type = "saturday"
+                local_hour = (now.hour + self._EKB_UTC_OFFSET) % 24
+                # Skip night hours — no regular service, data would be unreliable
+                if local_hour in self._NIGHT_HOURS:
+                    pass
                 else:
-                    day_type = "sunday"
+                    dow = now.weekday()
+                    if dow < 5:
+                        day_type = "weekday"
+                    elif dow == 5:
+                        day_type = "saturday"
+                    else:
+                        day_type = "sunday"
 
-                self._travel_time_batch.append({
-                    "route_id": state.route_id,
-                    "from_stop_id": prev["stop_id"],
-                    "to_stop_id": current_stop_id,
-                    "day_type": day_type,
-                    "hour": now.hour,
-                    "seconds": elapsed,
-                })
+                    self._travel_time_batch.append({
+                        "route_id": state.route_id,
+                        "from_stop_id": prev["stop_id"],
+                        "to_stop_id": current_stop_id,
+                        "day_type": day_type,
+                        "hour": local_hour,
+                        "seconds": elapsed,
+                    })
 
         self._last_stop_passage[state.id] = {
             "stop_id": current_stop_id,

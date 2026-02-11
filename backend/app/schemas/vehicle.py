@@ -25,6 +25,7 @@ class VehicleState(BaseModel):
     next_stops: list[NextStopInfo] = []
     progress: float | None = None
     timestamp: str | None = None
+    signal_lost: bool = False
 
 
 class VehicleSnapshot(BaseModel):
