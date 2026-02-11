@@ -79,6 +79,16 @@ class VehicleTracker:
         # Current vehicle states (vehicle_id -> VehicleState)
         self.current_states: dict[str, VehicleState] = {}
 
+        # Per-vehicle smoothing state for progress and speed
+        self._smooth: dict[str, dict] = {}
+        # {vehicle_id: {"progress": float, "speed": float, "direction": int, "route_id": int}}
+
+        # Per-vehicle stop passage tracking for travel time recording
+        # {vehicle_id: {"stop_id": int, "route_id": int, "time": datetime}}
+        self._last_stop_passage: dict[str, dict] = {}
+        # Batch of travel time observations to persist
+        self._travel_time_batch: list[dict] = []
+
         # Diagnostics: track unresolved stop IDs per route
         self._diag_unresolved: dict[int, list[int]] = {}  # route_id -> [stop_ids not in points]
         self._diag_total_path_stops: dict[int, int] = {}  # route_id -> total path entries
@@ -225,18 +235,21 @@ class VehicleTracker:
                 return
 
             states = []
+            now = datetime.datetime.now(datetime.timezone.utc)
             for rv in raw_vehicles:
                 state = self._process_vehicle(rv)
                 if state:
                     states.append(state)
                     self.current_states[state.id] = state
+                    self._record_stop_passage(state, now)
 
             # Publish to subscribers
             vehicles_data = [s.model_dump() for s in states]
             await self.broadcaster.publish(vehicles_data)
 
-            # Persist positions asynchronously
+            # Persist positions and travel times
             await self._persist_positions(raw_vehicles)
+            await self._persist_travel_times()
 
         except Exception:
             logger.exception("Error in vehicle poll cycle")
@@ -260,18 +273,60 @@ class VehicleTracker:
         if route_id is None:
             return state
 
-        # Route matching
+        # Route matching — project raw GPS onto route line
         match = self.route_matcher.match(route_id, rv.lat, rv.lon, rv.course)
         if not match:
+            # Clear stale smoothing if vehicle can't be matched
+            self._smooth.pop(rv.dev_id, None)
             return state
 
-        state.progress = match.progress
+        raw_progress = match.progress
+        direction = match.direction
+
+        # --- Smooth progress and speed ---
+        prev = self._smooth.get(rv.dev_id)
+        if prev and prev["route_id"] == route_id and prev["direction"] == direction:
+            # Same route + direction: apply EMA with monotonic constraint
+            alpha = 0.4
+            smoothed = prev["progress"] * (1 - alpha) + raw_progress * alpha
+
+            # Enforce monotonic movement (forward: increasing, reverse: decreasing)
+            if direction == 0:
+                smoothed = max(smoothed, prev["progress"])
+            else:
+                smoothed = min(smoothed, prev["progress"])
+
+            # Allow reset if raw position jumps far (route wrap-around or GPS jump)
+            delta = abs(raw_progress - prev["progress"])
+            if delta > 0.15:
+                smoothed = raw_progress  # Accept the jump
+
+            smoothed_speed = prev["speed"] * 0.6 + rv.speed * 0.4
+        else:
+            # New route, new direction, or first time — accept raw values
+            smoothed = raw_progress
+            smoothed_speed = rv.speed
+
+        self._smooth[rv.dev_id] = {
+            "progress": smoothed,
+            "speed": smoothed_speed,
+            "direction": direction,
+            "route_id": route_id,
+        }
+
+        state.progress = smoothed
+
+        # Snap displayed lat/lon to the route line
+        snapped = self.route_matcher.interpolate_progress(route_id, smoothed)
+        if snapped:
+            state.lat, state.lon = snapped
+
         total_len = self.route_matcher.get_total_length(route_id)
-        distance_along = match.progress * total_len
+        distance_along = smoothed * total_len
 
         # Stop detection (up to 5 next stops for richer data)
         detection = self.stop_detector.detect(
-            route_id, distance_along, match.direction, max_next=5
+            route_id, distance_along, direction, max_next=5
         )
 
         if detection.prev_stop:
@@ -280,10 +335,10 @@ class VehicleTracker:
                 name=detection.prev_stop.name,
             )
 
-        # ETA calculation
+        # ETA calculation — use smoothed speed
         if detection.next_stops:
             etas = self.eta_calculator.calculate(
-                distance_along, rv.speed, detection.next_stops
+                distance_along, smoothed_speed, detection.next_stops
             )
             state.next_stops = [
                 NextStopInfo(
@@ -370,6 +425,83 @@ out geom;
             logger.warning("Failed to fetch OSM geometries: %s", e)
 
         return result
+
+    def _record_stop_passage(self, state: VehicleState, now: datetime.datetime) -> None:
+        """Track when a vehicle passes a stop; record travel time between consecutive stops."""
+        if not state.prev_stop or not state.route_id:
+            return
+
+        prev = self._last_stop_passage.get(state.id)
+        current_stop_id = state.prev_stop.id
+
+        if prev and prev["stop_id"] != current_stop_id and prev["route_id"] == state.route_id:
+            elapsed = (now - prev["time"]).total_seconds()
+            # Sanity: only record if 10s < elapsed < 30min (filters GPS glitches)
+            if 10 < elapsed < 1800:
+                dow = now.weekday()
+                if dow < 5:
+                    day_type = "weekday"
+                elif dow == 5:
+                    day_type = "saturday"
+                else:
+                    day_type = "sunday"
+
+                self._travel_time_batch.append({
+                    "route_id": state.route_id,
+                    "from_stop_id": prev["stop_id"],
+                    "to_stop_id": current_stop_id,
+                    "day_type": day_type,
+                    "hour": now.hour,
+                    "seconds": elapsed,
+                })
+
+        self._last_stop_passage[state.id] = {
+            "stop_id": current_stop_id,
+            "route_id": state.route_id,
+            "time": now,
+        }
+
+    async def _persist_travel_times(self) -> None:
+        """Flush travel time observations to database with incremental averaging."""
+        if not self._travel_time_batch:
+            return
+        batch = self._travel_time_batch
+        self._travel_time_batch = []
+
+        try:
+            async with self.session_factory() as session:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                for obs in batch:
+                    # Upsert: incrementally update median (running average) and sample count
+                    await session.execute(
+                        text("""
+                            INSERT INTO travel_time_segments
+                                (route_id, from_stop_id, to_stop_id, day_type, hour,
+                                 median_seconds, sample_count, updated_at)
+                            VALUES (:rid, :from_id, :to_id, :day_type, :hour,
+                                    :seconds, 1, :now)
+                            ON CONFLICT (route_id, from_stop_id, to_stop_id, day_type, hour)
+                            DO UPDATE SET
+                                median_seconds = travel_time_segments.median_seconds +
+                                    (:seconds - travel_time_segments.median_seconds) /
+                                    (travel_time_segments.sample_count + 1),
+                                sample_count = travel_time_segments.sample_count + 1,
+                                updated_at = :now
+                        """),
+                        {
+                            "rid": obs["route_id"],
+                            "from_id": obs["from_stop_id"],
+                            "to_id": obs["to_stop_id"],
+                            "day_type": obs["day_type"],
+                            "hour": obs["hour"],
+                            "seconds": obs["seconds"],
+                            "now": now,
+                        },
+                    )
+                await session.commit()
+                logger.debug("Persisted %d travel time observations", len(batch))
+        except Exception:
+            logger.exception("Failed to persist travel times")
 
     async def _persist_positions(self, vehicles: list[RawVehicle]) -> None:
         """Save vehicle positions to database."""

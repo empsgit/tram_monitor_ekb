@@ -54,6 +54,7 @@ async function main() {
     const routes = await getRoutes();
     store.setRoutes(routes);
     routeLayer.loadRoutes(routes);
+    vehicleLayer.loadRoutes(routes);
     renderRouteFilter(routeFilterEl, routes);
   } catch (e) {
     console.error("Failed to load routes:", e);
