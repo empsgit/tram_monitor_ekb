@@ -410,6 +410,7 @@ class VehicleTracker:
 
         Returns a dict mapping route ref number (e.g. "1", "3") to [[lat, lon], ...].
         Only the forward direction (first relation per ref) is used.
+        Retries up to 3 times with exponential backoff on failure.
         """
         query = f"""
 [out:json][timeout:90];
@@ -417,42 +418,57 @@ relation["route"="tram"]({EKB_BBOX});
 out geom;
 """
         result: dict[str, list[list[float]]] = {}
-        try:
-            async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
-                resp = await client.post(OVERPASS_URL, data={"data": query})
-                resp.raise_for_status()
-                data = resp.json()
 
-            for element in data.get("elements", []):
-                if element.get("type") != "relation":
+        data = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0),
+                    verify=False,
+                ) as client:
+                    resp = await client.post(OVERPASS_URL, data={"data": query})
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break  # Success
+            except Exception as e:
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    "OSM geometry fetch attempt %d/3 failed: %s — retrying in %ds",
+                    attempt + 1, e, wait,
+                )
+                await asyncio.sleep(wait)
+
+        if data is None:
+            logger.error("All 3 OSM geometry fetch attempts failed — falling back to OSRM")
+            return result
+
+        for element in data.get("elements", []):
+            if element.get("type") != "relation":
+                continue
+            tags = element.get("tags", {})
+            ref = tags.get("ref", "")
+            if not ref or ref in result:
+                continue  # Take only the first relation per route number
+
+            # Extract geometry from member ways
+            coords: list[list[float]] = []
+            for member in element.get("members", []):
+                if member.get("type") != "way" or member.get("role") not in ("", "forward"):
                     continue
-                tags = element.get("tags", {})
-                ref = tags.get("ref", "")
-                if not ref or ref in result:
-                    continue  # Take only the first relation per route number
+                geom = member.get("geometry", [])
+                for pt in geom:
+                    lat, lon = pt.get("lat", 0), pt.get("lon", 0)
+                    if lat and lon:
+                        # Skip duplicate consecutive points
+                        if coords and coords[-1][0] == lat and coords[-1][1] == lon:
+                            continue
+                        coords.append([lat, lon])
 
-                # Extract geometry from member ways
-                coords: list[list[float]] = []
-                for member in element.get("members", []):
-                    if member.get("type") != "way" or member.get("role") not in ("", "forward"):
-                        continue
-                    geom = member.get("geometry", [])
-                    for pt in geom:
-                        lat, lon = pt.get("lat", 0), pt.get("lon", 0)
-                        if lat and lon:
-                            # Skip duplicate consecutive points
-                            if coords and coords[-1][0] == lat and coords[-1][1] == lon:
-                                continue
-                            coords.append([lat, lon])
+            if len(coords) >= 2:
+                result[ref] = coords
+                logger.debug("OSM geometry for route %s: %d points", ref, len(coords))
 
-                if len(coords) >= 2:
-                    result[ref] = coords
-                    logger.debug("OSM geometry for route %s: %d points", ref, len(coords))
-
-            logger.info("Fetched OSM geometries for %d tram routes", len(result))
-        except Exception as e:
-            logger.warning("Failed to fetch OSM geometries: %s", e)
-
+        logger.info("Fetched OSM geometries for %d tram routes", len(result))
         return result
 
     def _record_stop_passage(self, state: VehicleState, now: datetime.datetime) -> None:
