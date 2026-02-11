@@ -155,19 +155,24 @@ class EttuClient:
         """Fetch all tram stops."""
         stops = []
         try:
-            resp = await self._client.get("/api/v2/tram/stops/")
+            resp = await self._client.get("/api/v2/tram/points/")
             resp.raise_for_status()
             data = resp.json()
-            logger.debug("Stops response keys=%s count=%d", list(data.keys()) if isinstance(data, dict) else "list", len(data if isinstance(data, list) else data.get("stops", [])))
-
-            items = data if isinstance(data, list) else data.get("stops", [])
+            items = data if isinstance(data, list) else (
+                data.get("points", data.get("stops", data.get("stations", [])))
+            )
             for item in items:
                 try:
+                    # Skip inactive stops (STATUS != "1" or empty name)
+                    status = str(item.get("STATUS", item.get("status", "1")))
+                    name = str(item.get("NAME", item.get("name", "")))
+                    if status != "1" or not name:
+                        continue
                     stops.append(RawStop(
-                        id=int(item.get("id", item.get("ID", 0))),
-                        name=str(item.get("name", item.get("NAME", ""))),
-                        lat=float(item.get("lat", item.get("LAT", 0))),
-                        lon=float(item.get("lon", item.get("LON", item.get("lng", 0)))),
+                        id=int(item.get("ID", item.get("id", 0))),
+                        name=name,
+                        lat=float(item.get("LAT", item.get("lat", 0))),
+                        lon=float(item.get("LON", item.get("lon", item.get("lng", 0)))),
                     ))
                 except (ValueError, TypeError):
                     continue

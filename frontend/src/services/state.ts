@@ -76,8 +76,9 @@ class Store {
 
   getVisibleVehicles(): VehicleData[] {
     const result: VehicleData[] = [];
+    const hasFilter = this.state.enabledRoutes.size > 0;
     for (const v of this.state.vehicles.values()) {
-      if (this.state.enabledRoutes.has(v.route)) {
+      if (!hasFilter || this.state.enabledRoutes.has(v.route)) {
         result.push(v);
       }
     }
