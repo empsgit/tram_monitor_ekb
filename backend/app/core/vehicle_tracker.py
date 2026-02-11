@@ -220,9 +220,9 @@ class VehicleTracker:
         self, routes: list[RawRoute], stops: list[RawStop]
     ) -> None:
         """Upsert routes and stops to database."""
+        # Phase 1: persist stops and routes (must succeed for data to show)
         try:
             async with self.session_factory() as session:
-                # Upsert stops
                 for s in stops:
                     await session.execute(
                         text("""
@@ -233,19 +233,31 @@ class VehicleTracker:
                         {"id": s.id, "name": s.name, "lat": s.lat, "lon": s.lon},
                     )
 
-                # Upsert routes
                 for r in routes:
                     await session.execute(
                         text("""
-                            INSERT INTO routes (id, number, name)
-                            VALUES (:id, :number, :name)
+                            INSERT INTO routes (id, number, name, color)
+                            VALUES (:id, :number, :name, :color)
                             ON CONFLICT (id) DO UPDATE SET number=:number, name=:name
                         """),
-                        {"id": r.id, "number": r.number, "name": r.name},
+                        {"id": r.id, "number": r.number, "name": r.name, "color": "#e53935"},
                     )
 
-                    # Upsert route_stops
+                await session.commit()
+        except Exception:
+            logger.exception("Failed to persist routes/stops to database")
+            return
+
+        # Phase 2: persist route_stops (requires stops in DB, best-effort)
+        if not stops:
+            return
+        try:
+            async with self.session_factory() as session:
+                stop_ids = {s.id for s in stops}
+                for r in routes:
                     for s in r.stops:
+                        if s["id"] not in stop_ids:
+                            continue
                         await session.execute(
                             text("""
                                 INSERT INTO route_stops (route_id, stop_id, direction, "order")
@@ -260,10 +272,9 @@ class VehicleTracker:
                                 "ord": s["order"],
                             },
                         )
-
                 await session.commit()
         except Exception:
-            logger.exception("Failed to persist routes/stops to database")
+            logger.exception("Failed to persist route_stops to database")
 
     def get_vehicles_for_stop(self, stop_id: int, route_filter: int | None = None) -> list[dict]:
         """Get upcoming vehicles for a specific stop."""

@@ -155,12 +155,16 @@ class EttuClient:
         """Fetch all tram stops."""
         stops = []
         try:
-            resp = await self._client.get("/api/v2/tram/stops/")
+            resp = await self._client.get("/api/v2/tram/points/")
             resp.raise_for_status()
             data = resp.json()
-            logger.debug("Stops response keys=%s count=%d", list(data.keys()) if isinstance(data, dict) else "list", len(data if isinstance(data, list) else data.get("stops", [])))
+            logger.info("Points response keys=%s sample=%s",
+                        list(data.keys()) if isinstance(data, dict) else "list",
+                        str(data)[:500])
 
-            items = data if isinstance(data, list) else data.get("stops", [])
+            items = data if isinstance(data, list) else (
+                data.get("points", data.get("stops", data.get("stations", [])))
+            )
             for item in items:
                 try:
                     stops.append(RawStop(
