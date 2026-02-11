@@ -1,4 +1,4 @@
-"""Add route_geometry_cache table for caching OSM tram geometries.
+"""Add route_geometry_cache and data_cache_meta tables.
 
 Revision ID: 001
 Revises:
@@ -22,7 +22,13 @@ def upgrade() -> None:
         sa.Column("coords_json", JSONB, nullable=False),
         sa.Column("fetched_at", sa.DateTime(timezone=True), nullable=False),
     )
+    op.create_table(
+        "data_cache_meta",
+        sa.Column("cache_key", sa.String(50), primary_key=True),
+        sa.Column("refreshed_at", sa.DateTime(timezone=True), nullable=False),
+    )
 
 
 def downgrade() -> None:
+    op.drop_table("data_cache_meta")
     op.drop_table("route_geometry_cache")

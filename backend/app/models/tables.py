@@ -123,3 +123,13 @@ class RouteGeometryCache(Base):
     fetched_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class DataCacheMeta(Base):
+    """Tracks when external data sources were last refreshed."""
+    __tablename__ = "data_cache_meta"
+
+    cache_key: Mapped[str] = mapped_column(String(50), primary_key=True)
+    refreshed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )

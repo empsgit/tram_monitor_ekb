@@ -101,10 +101,18 @@ class VehicleTracker:
         self._diag_unresolved: dict[int, list[int]] = {}  # route_id -> [stop_ids not in points]
         self._diag_total_path_stops: dict[int, int] = {}  # route_id -> total path entries
 
+    # Cache TTL constants
+    STOPS_CACHE_TTL = 7 * 86400  # 7 days for stops (rarely change)
+    ROUTES_CACHE_TTL = 86400  # 24 hours for routes
+
     async def load_routes_and_stops(self) -> None:
-        """Fetch and load routes and stops from ETTU API into matchers."""
+        """Fetch and load routes and stops from ETTU API (or DB cache) into matchers."""
         routes = await self.ettu.fetch_routes()
-        stops = await self.ettu.fetch_stops()
+
+        # Try cached stops from DB; only fetch from ETTU if stale (>7 days) or empty
+        stops = await self._load_cached_stops()
+        if not stops:
+            stops = await self.ettu.fetch_stops()
 
         # Try cached OSM geometries first; fetch fresh if cache is stale (>24h)
         osm_geometries = await self._load_cached_geometries()
@@ -525,6 +533,58 @@ out geom;
         except Exception:
             logger.exception("Failed to save geometry cache to database")
 
+    async def _load_cached_stops(self) -> list[RawStop]:
+        """Load stops from database cache if fresh (< 7 days old)."""
+        try:
+            async with self.session_factory() as session:
+                # Check cache freshness
+                meta = await session.execute(
+                    text("SELECT refreshed_at FROM data_cache_meta WHERE cache_key = 'ettu_stops'")
+                )
+                row = meta.first()
+                if row:
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    age = now - row.refreshed_at.replace(tzinfo=datetime.timezone.utc)
+                    if age.total_seconds() > self.STOPS_CACHE_TTL:
+                        logger.info("Stops cache is stale (>7 days), will re-fetch from ETTU")
+                        return []
+                else:
+                    return []  # No cache timestamp → never cached
+
+                # Load stops from DB
+                result = await session.execute(
+                    text("SELECT id, name, direction, lat, lon FROM stops")
+                )
+                stops = []
+                for r in result:
+                    stops.append(RawStop(
+                        id=r.id, name=r.name, direction=r.direction or "",
+                        lat=r.lat, lon=r.lon,
+                    ))
+                if stops:
+                    logger.info("Loaded %d stops from database cache", len(stops))
+                return stops
+        except Exception:
+            logger.exception("Failed to load stops from database cache")
+        return []
+
+    async def _update_cache_timestamp(self, cache_key: str) -> None:
+        """Update the cache freshness timestamp for a given key."""
+        try:
+            async with self.session_factory() as session:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                await session.execute(
+                    text("""
+                        INSERT INTO data_cache_meta (cache_key, refreshed_at)
+                        VALUES (:key, :now)
+                        ON CONFLICT (cache_key) DO UPDATE SET refreshed_at = :now
+                    """),
+                    {"key": cache_key, "now": now},
+                )
+                await session.commit()
+        except Exception:
+            logger.exception("Failed to update cache timestamp for %s", cache_key)
+
     def _record_stop_passage(self, state: VehicleState, now: datetime.datetime) -> None:
         """Track when a vehicle passes a stop; record travel time between consecutive stops."""
         if not state.prev_stop or not state.route_id:
@@ -653,7 +713,7 @@ out geom;
         except Exception:
             logger.exception("Failed to persist routes to database")
 
-        # Phase 1b: persist named stops
+        # Phase 1b: persist named stops + update cache timestamp
         try:
             async with self.session_factory() as session:
                 for s in stops:
@@ -667,7 +727,10 @@ out geom;
                         """),
                         {"id": s.id, "name": s.name, "direction": s.direction, "lat": s.lat, "lon": s.lon},
                     )
+                # Clean up any stops with name='None' from previous bug
+                await session.execute(text("DELETE FROM stops WHERE name = 'None'"))
                 await session.commit()
+            await self._update_cache_timestamp("ettu_stops")
         except Exception:
             logger.exception("Failed to persist stops to database")
 
