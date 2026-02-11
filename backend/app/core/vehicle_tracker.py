@@ -114,6 +114,18 @@ class VehicleTracker:
                 else:
                     unresolved_ids.append(s["id"])
             route.stops = resolved_stops
+
+            # Resolve geometry stops (used for route line rendering)
+            resolved_geom = []
+            for s in route.geometry_stops:
+                stop_info = stop_lookup.get(s["id"])
+                if stop_info:
+                    s["name"] = stop_info.name
+                    s["direction_label"] = stop_info.direction
+                    s["lat"] = stop_info.lat
+                    s["lon"] = stop_info.lon
+                    resolved_geom.append(s)
+            route.geometry_stops = resolved_geom
             self._diag_total_path_stops[route.id] = total_path
             if unresolved_ids:
                 self._diag_unresolved[route.id] = unresolved_ids
@@ -131,13 +143,15 @@ class VehicleTracker:
             self._route_stop_ids[route.id] = list(named_ids)
 
             # Try OSRM for road-snapped geometry, fall back to stop-to-stop lines
-            osrm_geom = await self._fetch_osrm_geometry(route.stops)
+            # Use geometry_stops (from path) for clean routes without appendixes
+            geom_src = route.geometry_stops or route.stops
+            osrm_geom = await self._fetch_osrm_geometry(geom_src)
             if osrm_geom:
                 route.points = osrm_geom
-            elif not route.points and route.stops:
+            elif not route.points and geom_src:
                 route.points = [
                     [s["lat"], s["lon"]]
-                    for s in route.stops
+                    for s in geom_src
                     if s["lat"] != 0 and s["lon"] != 0
                 ]
 

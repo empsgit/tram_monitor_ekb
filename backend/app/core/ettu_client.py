@@ -48,6 +48,7 @@ class RawRoute:
     name: str = ""
     points: list[list[float]] = field(default_factory=list)  # [[lat, lon], ...]
     stops: list[dict] = field(default_factory=list)  # [{id, name, lat, lon, order, direction}]
+    geometry_stops: list[dict] = field(default_factory=list)  # subset used for geometry only
 
 
 class EttuClient:
@@ -153,11 +154,27 @@ class EttuClient:
                 if isinstance(elements, list):
                     for elem in elements:
                         direction = int(elem.get("ind", 0))
-                        path = elem.get("full_path", elem.get("path", []))
-                        if isinstance(path, list):
-                            for order, stop_id_str in enumerate(path):
+                        # full_path has ALL stops (for tracking);
+                        # path has major stops only (for clean geometry)
+                        full_path = elem.get("full_path", elem.get("path", []))
+                        geom_path = elem.get("path", full_path)
+                        if isinstance(full_path, list):
+                            for order, stop_id_str in enumerate(full_path):
                                 try:
                                     route.stops.append({
+                                        "id": int(stop_id_str),
+                                        "name": "",
+                                        "lat": 0.0,
+                                        "lon": 0.0,
+                                        "order": order,
+                                        "direction": direction,
+                                    })
+                                except (ValueError, TypeError):
+                                    continue
+                        if isinstance(geom_path, list):
+                            for order, stop_id_str in enumerate(geom_path):
+                                try:
+                                    route.geometry_stops.append({
                                         "id": int(stop_id_str),
                                         "name": "",
                                         "lat": 0.0,
