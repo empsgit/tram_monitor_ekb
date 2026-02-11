@@ -18,6 +18,9 @@ from app.schemas.vehicle import VehicleState, NextStopInfo, StopInfo
 logger = logging.getLogger(__name__)
 
 OSRM_BASE = "https://router.project-osrm.org"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Bounding box for Ekaterinburg tram network (south,west,north,east)
+EKB_BBOX = "56.7,60.4,56.95,60.8"
 
 
 def _stop_display_name(name: str, direction: str) -> str:
@@ -85,6 +88,9 @@ class VehicleTracker:
         routes = await self.ettu.fetch_routes()
         stops = await self.ettu.fetch_stops()
 
+        # Fetch OSM geometries (actual tram track lines from OpenStreetMap)
+        osm_geometries = await self._fetch_osm_geometries()
+
         # Build stop lookup from ALL stops (including unnamed) for route resolution
         stop_lookup: dict[int, RawStop] = {s.id: s for s in stops}
 
@@ -142,27 +148,35 @@ class VehicleTracker:
                     named_ids.add(s["id"])
             self._route_stop_ids[route.id] = list(named_ids)
 
-            # Try OSRM for road-snapped geometry, fall back to stop-to-stop lines
-            # Use geometry_stops (from path) for clean routes without appendixes
-            geom_src = route.geometry_stops or route.stops
-            osrm_geom = await self._fetch_osrm_geometry(geom_src)
-            if osrm_geom:
-                route.points = osrm_geom
-            elif not route.points and geom_src:
-                route.points = [
-                    [s["lat"], s["lon"]]
-                    for s in geom_src
-                    if s["lat"] != 0 and s["lon"] != 0
-                ]
+            # Route geometry priority: OSM > OSRM > stop-to-stop lines
+            osm_geom = osm_geometries.get(route.number)
+            if osm_geom:
+                route.points = osm_geom
+                logger.debug("Route %s: using OSM geometry (%d pts)", route.number, len(osm_geom))
+            else:
+                geom_src = route.geometry_stops or route.stops
+                osrm_geom = await self._fetch_osrm_geometry(geom_src)
+                if osrm_geom:
+                    route.points = osrm_geom
+                    logger.debug("Route %s: using OSRM geometry", route.number)
+                elif not route.points and geom_src:
+                    route.points = [
+                        [s["lat"], s["lon"]]
+                        for s in geom_src
+                        if s["lat"] != 0 and s["lon"] != 0
+                    ]
+                    logger.debug("Route %s: using stop-to-stop fallback", route.number)
 
             # Store geometry for API exposure
             if route.points:
                 self._route_geometries[route.id] = route.points
                 self.route_matcher.load_route(route.id, route.points)
 
-            # Load stops for this route
+            # Load stops for this route (only named stops for the detector)
             route_stops = []
             for s in route.stops:
+                if not s["name"]:
+                    continue  # Skip unnamed stops – they show as blank in popups
                 if route.points:
                     match = self.route_matcher.match(route.id, s["lat"], s["lon"])
                     if match:
@@ -306,6 +320,56 @@ class VehicleTracker:
         except Exception as e:
             logger.debug("OSRM geometry fetch failed: %s", e)
         return None
+
+    async def _fetch_osm_geometries(self) -> dict[str, list[list[float]]]:
+        """Fetch tram route geometries from OpenStreetMap via Overpass API.
+
+        Returns a dict mapping route ref number (e.g. "1", "3") to [[lat, lon], ...].
+        Only the forward direction (first relation per ref) is used.
+        """
+        query = f"""
+[out:json][timeout:90];
+relation["route"="tram"]({EKB_BBOX});
+out geom;
+"""
+        result: dict[str, list[list[float]]] = {}
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(OVERPASS_URL, data={"data": query})
+                resp.raise_for_status()
+                data = resp.json()
+
+            for element in data.get("elements", []):
+                if element.get("type") != "relation":
+                    continue
+                tags = element.get("tags", {})
+                ref = tags.get("ref", "")
+                if not ref or ref in result:
+                    continue  # Take only the first relation per route number
+
+                # Extract geometry from member ways
+                coords: list[list[float]] = []
+                for member in element.get("members", []):
+                    if member.get("type") != "way" or member.get("role") not in ("", "forward"):
+                        continue
+                    geom = member.get("geometry", [])
+                    for pt in geom:
+                        lat, lon = pt.get("lat", 0), pt.get("lon", 0)
+                        if lat and lon:
+                            # Skip duplicate consecutive points
+                            if coords and coords[-1][0] == lat and coords[-1][1] == lon:
+                                continue
+                            coords.append([lat, lon])
+
+                if len(coords) >= 2:
+                    result[ref] = coords
+                    logger.debug("OSM geometry for route %s: %d points", ref, len(coords))
+
+            logger.info("Fetched OSM geometries for %d tram routes", len(result))
+        except Exception as e:
+            logger.warning("Failed to fetch OSM geometries: %s", e)
+
+        return result
 
     async def _persist_positions(self, vehicles: list[RawVehicle]) -> None:
         """Save vehicle positions to database."""
