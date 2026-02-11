@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import json
 import logging
 import math
 
@@ -105,8 +106,12 @@ class VehicleTracker:
         routes = await self.ettu.fetch_routes()
         stops = await self.ettu.fetch_stops()
 
-        # Fetch OSM geometries (actual tram track lines from OpenStreetMap)
-        osm_geometries = await self._fetch_osm_geometries()
+        # Try cached OSM geometries first; fetch fresh if cache is stale (>24h)
+        osm_geometries = await self._load_cached_geometries()
+        if not osm_geometries:
+            osm_geometries = await self._fetch_osm_geometries()
+            if osm_geometries:
+                await self._save_geometry_cache(osm_geometries)
 
         # Build stop lookup from ALL stops (including unnamed) for route resolution
         stop_lookup: dict[int, RawStop] = {s.id: s for s in stops}
@@ -470,6 +475,55 @@ out geom;
 
         logger.info("Fetched OSM geometries for %d tram routes", len(result))
         return result
+
+    async def _load_cached_geometries(self) -> dict[str, list[list[float]]]:
+        """Load OSM geometries from database cache if fresh (< 24 hours old)."""
+        result: dict[str, list[list[float]]] = {}
+        try:
+            async with self.session_factory() as session:
+                rows = await session.execute(
+                    text("SELECT route_number, coords_json, fetched_at FROM route_geometry_cache")
+                )
+                now = datetime.datetime.now(datetime.timezone.utc)
+                stale = False
+                for row in rows:
+                    age = now - row.fetched_at.replace(tzinfo=datetime.timezone.utc)
+                    if age.total_seconds() > 86400:  # 24 hours
+                        stale = True
+                        break
+                    coords = row.coords_json
+                    if isinstance(coords, list) and len(coords) >= 2:
+                        result[row.route_number] = coords
+
+                if stale:
+                    logger.info("OSM geometry cache is stale (>24h), will re-fetch from Overpass")
+                    return {}
+                if result:
+                    logger.info("Loaded OSM geometries for %d routes from cache", len(result))
+        except Exception:
+            logger.exception("Failed to load geometry cache from database")
+        return result
+
+    async def _save_geometry_cache(self, geometries: dict[str, list[list[float]]]) -> None:
+        """Save OSM geometries to database cache."""
+        try:
+            async with self.session_factory() as session:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                for route_number, coords in geometries.items():
+                    await session.execute(
+                        text("""
+                            INSERT INTO route_geometry_cache (route_number, coords_json, fetched_at)
+                            VALUES (:rn, CAST(:coords AS jsonb), :now)
+                            ON CONFLICT (route_number) DO UPDATE SET
+                                coords_json = CAST(:coords AS jsonb),
+                                fetched_at = :now
+                        """),
+                        {"rn": route_number, "coords": json.dumps(coords), "now": now},
+                    )
+                await session.commit()
+                logger.info("Saved OSM geometries for %d routes to cache", len(geometries))
+        except Exception:
+            logger.exception("Failed to save geometry cache to database")
 
     def _record_stop_passage(self, state: VehicleState, now: datetime.datetime) -> None:
         """Track when a vehicle passes a stop; record travel time between consecutive stops."""

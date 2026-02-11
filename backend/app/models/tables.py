@@ -12,6 +12,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -110,5 +111,15 @@ class TravelTimeSegment(Base):
     p75_seconds: Mapped[float] = mapped_column(Float, nullable=True)
     sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class RouteGeometryCache(Base):
+    __tablename__ = "route_geometry_cache"
+
+    route_number: Mapped[str] = mapped_column(String(10), primary_key=True)
+    coords_json: Mapped[list] = mapped_column(JSONB, nullable=False)  # [[lat, lon], ...]
+    fetched_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
