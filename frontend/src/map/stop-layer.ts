@@ -4,11 +4,16 @@ import L from "leaflet";
 import type { StopInfo } from "../services/api-client";
 import { store } from "../services/state";
 
+const STOP_PANE = "stopPane";
+
 export class StopLayer {
   private markers: Map<number, L.CircleMarker> = new Map();
   private layerGroup: L.LayerGroup;
 
   constructor(map: L.Map) {
+    // Create a custom pane above overlayPane (z-index 400) so stops sit above route lines
+    const pane = map.createPane(STOP_PANE);
+    pane.style.zIndex = "450";
     this.layerGroup = L.layerGroup().addTo(map);
   }
 
@@ -18,9 +23,10 @@ export class StopLayer {
 
     for (const stop of stops) {
       const marker = L.circleMarker([stop.lat, stop.lon], {
-        radius: 4,
+        pane: STOP_PANE,
+        radius: 6,
         fillColor: "#60a5fa",
-        fillOpacity: 0.8,
+        fillOpacity: 0.9,
         color: "white",
         weight: 1.5,
       });
@@ -30,7 +36,7 @@ export class StopLayer {
         : stop.name;
       marker.bindTooltip(label, {
         direction: "top",
-        offset: [0, -6],
+        offset: [0, -8],
         className: "stop-tooltip",
       });
 
@@ -50,9 +56,9 @@ export class StopLayer {
   setDimming(activeStopIds: Set<number> | null): void {
     for (const [id, m] of this.markers) {
       if (activeStopIds === null || activeStopIds.has(id)) {
-        m.setStyle({ fillOpacity: 0.8, radius: 4, fillColor: "#60a5fa" });
+        m.setStyle({ fillOpacity: 0.9, radius: 6, fillColor: "#60a5fa" });
       } else {
-        m.setStyle({ fillOpacity: 0.12, radius: 2, fillColor: "#94a3b8" });
+        m.setStyle({ fillOpacity: 0.15, radius: 3, fillColor: "#94a3b8" });
       }
     }
   }
@@ -60,12 +66,12 @@ export class StopLayer {
   highlightStop(stopId: number): void {
     // Reset all to default (dimming will be re-applied by caller)
     for (const [, m] of this.markers) {
-      m.setStyle({ radius: 4, fillColor: "#60a5fa", weight: 1.5 });
+      m.setStyle({ radius: 6, fillColor: "#60a5fa", weight: 1.5 });
     }
     const selected = this.markers.get(stopId);
     if (selected) {
       selected.setStyle({
-        radius: 8,
+        radius: 10,
         fillColor: "#e94560",
         fillOpacity: 1,
         weight: 3,
