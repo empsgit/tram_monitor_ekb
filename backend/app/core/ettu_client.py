@@ -162,8 +162,10 @@ class EttuClient:
                 # Parse elements → extract ordered stop IDs from path
                 elements = item.get("elements", [])
                 if isinstance(elements, list):
-                    for elem in elements:
-                        direction = int(elem.get("ind", 0))
+                    for dir_idx, elem in enumerate(elements):
+                        # Use element position as direction (0=forward, 1=reverse),
+                        # NOT elem["ind"] which is an opaque element ID (e.g. 30, 40)
+                        direction = dir_idx
                         # full_path has ALL stops (for tracking);
                         # path has major stops only (for clean geometry)
                         full_path = elem.get("full_path", elem.get("path", []))
