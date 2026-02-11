@@ -1,7 +1,6 @@
-/** Manages tram vehicle markers on the map with smooth animation and trails. */
+/** Manages tram vehicle markers with continuous client-side interpolation. */
 
 import L from "leaflet";
-import "leaflet.marker.slideto";
 import type { VehicleData } from "../services/ws-client";
 
 // Maximally distinct color palette (Kelly's colors + extras)
@@ -40,57 +39,89 @@ function createIcon(routeNum: string): L.DivIcon {
   });
 }
 
-interface MarkerMeta {
-  route: string;
-  course: number;
+// --- Dead-reckoning constants ---
+const INTERP_DURATION = 10000; // ms — matches server poll interval
+const MAX_EXTRAP_MS = 5000;    // ms — extrapolate up to 5s beyond target
+const DEG2RAD = Math.PI / 180;
+const M_PER_DEG_LAT = 111320;
+const MAX_TRAIL_POINTS = 20;
+
+/** Interpolate between two angles via the shortest arc. */
+function lerpAngle(from: number, to: number, t: number): number {
+  const diff = ((to - from) % 360 + 540) % 360 - 180;
+  return (from + diff * t + 360) % 360;
 }
 
-const SLIDE_DURATION = 9500;
-const MAX_TRAIL_POINTS = 20; // ~3 minutes of history
+interface TrackedVehicle {
+  marker: L.Marker;
+  route: string;
+  // Animated position snapshot when the latest update arrived
+  prevLat: number;
+  prevLon: number;
+  prevCourse: number;
+  // Target from the latest server update
+  targetLat: number;
+  targetLon: number;
+  targetCourse: number;
+  targetSpeed: number; // km/h
+  // Timing
+  updateTime: number; // performance.now()
+  // Current rendered values
+  currentLat: number;
+  currentLon: number;
+  currentCourse: number;
+}
 
 export class VehicleLayer {
-  private markers: Map<string, L.Marker> = new Map();
-  private meta: Map<string, MarkerMeta> = new Map();
+  private tracked: Map<string, TrackedVehicle> = new Map();
   private trailPoints: Map<string, [number, number][]> = new Map();
   private trailLines: Map<string, L.Polyline> = new Map();
   private layerGroup: L.LayerGroup;
   private trailGroup: L.LayerGroup;
+  private rafId: number = 0;
 
   constructor(map: L.Map) {
-    // Trail layer behind markers
     this.trailGroup = L.layerGroup().addTo(map);
     this.layerGroup = L.layerGroup().addTo(map);
+    this.startAnimation();
   }
 
+  /** Kick off the continuous animation loop. */
+  private startAnimation(): void {
+    const animate = () => {
+      this.interpolateAll();
+      this.rafId = requestAnimationFrame(animate);
+    };
+    this.rafId = requestAnimationFrame(animate);
+  }
+
+  /** Called on each server update (~10 s). Stores targets, creates/removes markers, updates trails. */
   update(vehicles: VehicleData[]): void {
+    const now = performance.now();
     const seen = new Set<string>();
 
     for (const v of vehicles) {
       seen.add(v.id);
-      const existing = this.markers.get(v.id);
-
-      // Update trail
       this.updateTrail(v);
 
-      if (existing) {
-        const marker = existing as any;
-        if (typeof marker.slideTo === "function") {
-          marker.slideTo([v.lat, v.lon], {
-            duration: SLIDE_DURATION,
-            keepAtCenter: false,
-          });
-        } else {
-          existing.setLatLng([v.lat, v.lon]);
-        }
+      const tv = this.tracked.get(v.id);
+      if (tv) {
+        // Snap "previous" to wherever the marker currently is
+        tv.prevLat = tv.currentLat;
+        tv.prevLon = tv.currentLon;
+        tv.prevCourse = tv.currentCourse;
+        // Set new target
+        tv.targetLat = v.lat;
+        tv.targetLon = v.lon;
+        tv.targetCourse = v.course;
+        tv.targetSpeed = v.speed;
+        tv.updateTime = now;
 
-        const prev = this.meta.get(v.id);
-        if (!prev || prev.route !== v.route) {
-          existing.setIcon(createIcon(v.route));
+        if (tv.route !== v.route) {
+          tv.marker.setIcon(createIcon(v.route));
+          tv.route = v.route;
         }
-
-        this.updateHeading(existing, v.course);
-        this.meta.set(v.id, { route: v.route, course: v.course });
-        existing.setPopupContent(this.popupHtml(v));
+        tv.marker.setPopupContent(this.popupHtml(v));
       } else {
         const marker = L.marker([v.lat, v.lon], {
           icon: createIcon(v.route),
@@ -98,18 +129,31 @@ export class VehicleLayer {
         });
         marker.bindPopup(this.popupHtml(v));
         marker.addTo(this.layerGroup);
-        this.markers.set(v.id, marker);
-        this.meta.set(v.id, { route: v.route, course: v.course });
         this.updateHeading(marker, v.course);
+
+        this.tracked.set(v.id, {
+          marker,
+          route: v.route,
+          prevLat: v.lat,
+          prevLon: v.lon,
+          prevCourse: v.course,
+          targetLat: v.lat,
+          targetLon: v.lon,
+          targetCourse: v.course,
+          targetSpeed: v.speed,
+          updateTime: now,
+          currentLat: v.lat,
+          currentLon: v.lon,
+          currentCourse: v.course,
+        });
       }
     }
 
     // Remove stale markers and trails
-    for (const [id, marker] of this.markers) {
+    for (const [id, tv] of this.tracked) {
       if (!seen.has(id)) {
-        this.layerGroup.removeLayer(marker);
-        this.markers.delete(id);
-        this.meta.delete(id);
+        this.layerGroup.removeLayer(tv.marker);
+        this.tracked.delete(id);
         const trail = this.trailLines.get(id);
         if (trail) {
           this.trailGroup.removeLayer(trail);
@@ -120,10 +164,63 @@ export class VehicleLayer {
     }
   }
 
+  /**
+   * Runs every animation frame (~60 fps).
+   *
+   * Phase 1 (0 – 10 s): linear interpolation from previous position to server target.
+   * Phase 2 (10 – 15 s): dead-reckoning extrapolation using speed + heading.
+   *
+   * This eliminates the "move-stop-move" pattern completely.
+   */
+  private interpolateAll(): void {
+    const now = performance.now();
+
+    for (const [, tv] of this.tracked) {
+      const elapsed = now - tv.updateTime;
+      let lat: number, lon: number, course: number;
+
+      if (elapsed < INTERP_DURATION) {
+        // Smooth interpolation toward server target
+        const t = elapsed / INTERP_DURATION;
+        lat = tv.prevLat + (tv.targetLat - tv.prevLat) * t;
+        lon = tv.prevLon + (tv.targetLon - tv.prevLon) * t;
+        // Heading settles faster (~3 seconds)
+        const ht = Math.min(elapsed / 3000, 1);
+        course = lerpAngle(tv.prevCourse, tv.targetCourse, ht);
+      } else {
+        // Dead reckoning: continue moving based on last known speed + heading
+        const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
+        const extraS = extraMs / 1000;
+        const speedMs = tv.targetSpeed / 3.6;
+        const bearing = tv.targetCourse * DEG2RAD;
+        const dMeters = speedMs * extraS;
+        const cosLat = Math.cos(tv.targetLat * DEG2RAD);
+
+        lat = tv.targetLat + (dMeters * Math.cos(bearing)) / M_PER_DEG_LAT;
+        lon = tv.targetLon + (dMeters * Math.sin(bearing)) / (M_PER_DEG_LAT * cosLat);
+        course = tv.targetCourse;
+      }
+
+      // Only touch the DOM when the value actually changed
+      if (
+        Math.abs(lat - tv.currentLat) > 0.0000005 ||
+        Math.abs(lon - tv.currentLon) > 0.0000005
+      ) {
+        tv.marker.setLatLng([lat, lon]);
+        tv.currentLat = lat;
+        tv.currentLon = lon;
+      }
+
+      if (Math.abs(course - tv.currentCourse) > 0.3) {
+        this.updateHeading(tv.marker, course);
+        tv.currentCourse = course;
+      }
+    }
+  }
+
   private updateTrail(v: VehicleData): void {
     const pts = this.trailPoints.get(v.id) || [];
     const last = pts[pts.length - 1];
-    // Only add if position changed noticeably
     if (!last || Math.abs(last[0] - v.lat) > 0.00002 || Math.abs(last[1] - v.lon) > 0.00002) {
       pts.push([v.lat, v.lon]);
       if (pts.length > MAX_TRAIL_POINTS) pts.shift();
@@ -184,10 +281,10 @@ export class VehicleLayer {
   }
 
   clear(): void {
+    cancelAnimationFrame(this.rafId);
     this.layerGroup.clearLayers();
     this.trailGroup.clearLayers();
-    this.markers.clear();
-    this.meta.clear();
+    this.tracked.clear();
     this.trailPoints.clear();
     this.trailLines.clear();
   }
