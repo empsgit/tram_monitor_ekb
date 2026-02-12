@@ -406,6 +406,26 @@ export class VehicleLayer {
         lat = tv.prevLat + (tv.targetLat - tv.prevLat) * easedT;
         lon = tv.prevLon + (tv.targetLon - tv.prevLon) * easedT;
         course = lerpAngle(tv.prevCourse, tv.targetCourse, easedT);
+
+        // After interpolation phase, extrapolate along course at reported speed
+        // so the marker keeps moving smoothly between server updates.
+        if (
+          !tv.signalLost &&
+          tv.targetSpeed >= MIN_MOVING_SPEED_KMH &&
+          elapsed > INTERP_DURATION
+        ) {
+          const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
+          const meters = Math.min(
+            (tv.targetSpeed / 3.6) * (extraMs / 1000),
+            MAX_ROUTE_EXTRAP_METERS,
+          );
+          const cRad = tv.targetCourse * DEG2RAD;
+          const cosLat = Math.cos(tv.targetLat * DEG2RAD);
+          lat = tv.targetLat + (meters * Math.cos(cRad)) / M_PER_DEG_LAT;
+          lon = tv.targetLon + (meters * Math.sin(cRad)) / (M_PER_DEG_LAT * cosLat);
+          course = tv.targetCourse;
+        }
+
         tv.currentProgress = tv.targetProgress;
       }
 
