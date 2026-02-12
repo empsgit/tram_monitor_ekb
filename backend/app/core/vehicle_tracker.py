@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import math
+from collections import deque
 
 import httpx
 from sqlalchemy import text
@@ -110,6 +111,7 @@ class VehicleTracker:
         # Diagnostics: track unresolved stop IDs per route
         self._diag_unresolved: dict[int, list[int]] = {}  # route_id -> [stop_ids not in points]
         self._diag_total_path_stops: dict[int, int] = {}  # route_id -> total path entries
+        self._projection_events: deque[dict] = deque(maxlen=500)
 
     # Cache TTL constants
     STOPS_CACHE_TTL = 7 * 86400  # 7 days for stops (rarely change)
@@ -419,6 +421,15 @@ class VehicleTracker:
                             "Vehicle %s route %s: projection %.3f outside section [%s->%s]=[%.3f,%.3f]",
                             rv.dev_id, route_id, raw_progress, sec_prev, sec_next, lo, hi,
                         )
+                        self._log_projection_event("out_of_section", {
+                            "vehicle_id": rv.dev_id,
+                            "route_id": route_id,
+                            "raw_progress": round(raw_progress, 6),
+                            "section_prev_stop": sec_prev,
+                            "section_next_stop": sec_next,
+                            "section_lo": round(lo, 6),
+                            "section_hi": round(hi, 6),
+                        })
                         bounded_progress = min(max(raw_progress, lo), hi)
 
             # Enforce forward movement within selected direction.
@@ -429,29 +440,40 @@ class VehicleTracker:
                         "Vehicle %s route %s: backward projection %.3f -> %.3f (dir=0)",
                         rv.dev_id, route_id, prev_progress, bounded_progress,
                     )
+                    self._log_projection_event("backward_projection", {
+                        "vehicle_id": rv.dev_id,
+                        "route_id": route_id,
+                        "direction": 0,
+                        "prev_progress": round(prev_progress, 6),
+                        "new_progress": round(bounded_progress, 6),
+                    })
                     bounded_progress = prev_progress
                 elif direction == 1 and bounded_progress - 0.001 > prev_progress:
                     logger.warning(
                         "Vehicle %s route %s: backward projection %.3f -> %.3f (dir=1)",
                         rv.dev_id, route_id, prev_progress, bounded_progress,
                     )
+                    self._log_projection_event("backward_projection", {
+                        "vehicle_id": rv.dev_id,
+                        "route_id": route_id,
+                        "direction": 1,
+                        "prev_progress": round(prev_progress, 6),
+                        "new_progress": round(bounded_progress, 6),
+                    })
                     bounded_progress = prev_progress
 
             state.progress = bounded_progress
             snapped = self.route_matcher.interpolate_progress(route_id, bounded_progress)
             if snapped:
-                snap_error_m = _haversine(rv.lat, rv.lon, snapped[0], snapped[1])
-                if snap_error_m > MAX_SNAP_ERROR_M:
-                    # Smoothing produced a point too far from observed GPS.
-                    # Fall back to the nearest on-route projection from current GPS.
-                    smoothed = raw_progress
-                    snapped = self.route_matcher.interpolate_progress(route_id, smoothed)
-
-            state.progress = smoothed
-            if snapped:
                 state.lat, state.lon = snapped
         else:
             state.progress = None
+            if match:
+                self._log_projection_event("snap_rejected_far", {
+                    "vehicle_id": rv.dev_id,
+                    "route_id": route_id,
+                    "distance_m": round(match.distance_m, 2),
+                })
 
         self._smooth[rv.dev_id] = {
             "progress": state.progress,
@@ -839,6 +861,26 @@ out geom;
                 await session.commit()
         except Exception:
             logger.exception("Failed to persist route_stops to database")
+
+    def _log_projection_event(self, kind: str, payload: dict) -> None:
+        event = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "kind": kind,
+            **payload,
+        }
+        self._projection_events.append(event)
+
+    def get_projection_diagnostics(self, limit: int = 100) -> dict:
+        events = list(self._projection_events)[-max(1, min(limit, 500)):]
+        counts: dict[str, int] = {}
+        for e in self._projection_events:
+            k = e.get("kind", "unknown")
+            counts[k] = counts.get(k, 0) + 1
+        return {
+            "events_total": len(self._projection_events),
+            "counts": counts,
+            "latest": events,
+        }
 
     def get_diagnostics(self) -> dict:
         """Get pipeline diagnostics for debugging route-stop resolution."""

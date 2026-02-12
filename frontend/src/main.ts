@@ -77,6 +77,15 @@ async function main() {
   // We show vehicles only after receiving a live `update` frame.
   let hasFreshVehicleUpdate = false;
 
+  const SNAPSHOT_MAX_AGE_MS = 20_000;
+
+  const isFreshSnapshot = (ts: string | null): boolean => {
+    if (!ts) return false;
+    const parsed = Date.parse(ts);
+    if (Number.isNaN(parsed)) return false;
+    return Date.now() - parsed <= SNAPSHOT_MAX_AGE_MS;
+  };
+
   wsClient.onStatusChange = (connected) => {
     store.setConnected(connected);
     statusDot.classList.toggle("connected", connected);
@@ -95,8 +104,15 @@ async function main() {
       return;
     }
 
-    // Ignore startup snapshot until first live update arrives.
+    // Accept startup snapshot only if it is fresh by API vehicle timestamps.
     if (hasFreshVehicleUpdate) {
+      store.updateVehicles(msg.vehicles);
+      return;
+    }
+
+    const hasVehicles = msg.vehicles.length > 0;
+    const snapshotIsFresh = hasVehicles && msg.vehicles.every((v) => isFreshSnapshot(v.timestamp));
+    if (snapshotIsFresh) {
       store.updateVehicles(msg.vehicles);
     }
   });
