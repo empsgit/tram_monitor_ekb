@@ -384,7 +384,9 @@ class VehicleTracker:
                 for stop, eta_s in etas
             ]
 
-        # --- Route matching (for map display only: snapping + animation) ---
+        # --- Route matching (for progress tracking only, NOT for position) ---
+        # We keep progress for potential animation use but NEVER override
+        # the real GPS coordinates — the ETTU API positions are accurate.
         match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing)
         if match:
             raw_progress = match.progress
@@ -404,9 +406,7 @@ class VehicleTracker:
                 smoothed = raw_progress
 
             state.progress = smoothed
-            snapped = self.route_matcher.interpolate_progress(route_id, smoothed)
-            if snapped:
-                state.lat, state.lon = snapped
+            # Do NOT snap lat/lon — use raw GPS from API
         else:
             smoothed = prev["progress"] if prev and prev["route_id"] == route_id else None
             state.progress = smoothed
