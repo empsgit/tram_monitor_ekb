@@ -42,11 +42,12 @@ function createIcon(routeNum: string, signalLost = false): L.DivIcon {
 }
 
 // --- Animation constants ---
-const INTERP_DURATION = 1200; // ms — quickly converge to latest server point
+const INTERP_DURATION = 3600; // ms — slower convergence to reduce visible corrections
 const MAX_EXTRAP_MS = 12000; // ms — capped route extrapolation between updates
 const MAX_ROUTE_EXTRAP_METERS = 140; // hard cap to prevent visible drift
 const MIN_MOVING_SPEED_KMH = 3;
 const STATIONARY_SPEED_KMH = 0.1;
+const EXTRAP_SPEED_FACTOR = 1 / 3; // move between updates ~3x slower
 const DEG2RAD = Math.PI / 180;
 const M_PER_DEG_LAT = 111320;
 
@@ -134,6 +135,7 @@ interface TrackedVehicle {
   targetCourse: number;
   targetSpeed: number; // km/h
   targetHasServerProgress: boolean;
+  travelDir: 1 | -1 | null;
   // Timing
   updateTime: number; // performance.now()
   // Current rendered values
@@ -303,7 +305,24 @@ export class VehicleLayer {
         // Keep previous heading while stopped to avoid random spins at 0 km/h.
         tv.targetCourse = v.speed <= STATIONARY_SPEED_KMH ? tv.currentCourse : v.course;
         tv.targetSpeed = v.speed;
-        tv.targetProgress = targetProgress;
+
+        let nextTargetProgress = targetProgress;
+        if (hasGeom && nextTargetProgress != null && tv.currentProgress != null) {
+          const delta = nextTargetProgress - tv.currentProgress;
+          if (Math.abs(delta) > 0.0002) {
+            tv.travelDir = delta >= 0 ? 1 : -1;
+          }
+          // Do not move backward while actively moving: this removes route "rollback" jitter.
+          if (v.speed >= MIN_MOVING_SPEED_KMH) {
+            if (tv.travelDir > 0 && nextTargetProgress < tv.currentProgress) {
+              nextTargetProgress = tv.currentProgress;
+            } else if (tv.travelDir < 0 && nextTargetProgress > tv.currentProgress) {
+              nextTargetProgress = tv.currentProgress;
+            }
+          }
+        }
+
+        tv.targetProgress = nextTargetProgress;
         tv.targetHasServerProgress = targetHasServerProgress;
         tv.routeId = v.route_id;
         tv.updateTime = now;
@@ -349,6 +368,7 @@ export class VehicleLayer {
           targetCourse: v.course,
           targetSpeed: v.speed,
           targetHasServerProgress: v.progress != null,
+          travelDir: null,
           updateTime: now,
           currentLat: initialLat,
           currentLon: initialLon,
@@ -387,20 +407,28 @@ export class VehicleLayer {
       let course: number;
 
       const geom = tv.routeId != null ? this.routeGeometries.get(tv.routeId) : undefined;
-      const useRoutedAnimation = geom && tv.prevProgress != null && tv.targetProgress != null;
+      const routedTargetProgress = tv.targetProgress ?? tv.currentProgress;
+      const useRoutedAnimation = geom && tv.prevProgress != null && routedTargetProgress != null;
 
       if (useRoutedAnimation) {
         // ETTU course is visually offset by 90deg in this project;
         // normalize it for motion math (travel direction inference).
         const motionCourse = (tv.targetCourse - 90 + 360) % 360;
-        const travelDir = inferTravelDir(
+        const inferredDir = inferTravelDir(
           geom!,
           tv.prevProgress!,
-          tv.targetProgress!,
+          routedTargetProgress!,
           motionCourse,
         );
+        const travelDir = tv.travelDir ?? inferredDir;
         let progress =
-          tv.prevProgress! + (tv.targetProgress! - tv.prevProgress!) * easedT;
+          tv.prevProgress! + (routedTargetProgress! - tv.prevProgress!) * easedT;
+
+        if (tv.targetSpeed >= MIN_MOVING_SPEED_KMH && tv.currentProgress != null) {
+          // Keep progress monotonic while moving to prevent back-and-forth corrections.
+          if (travelDir > 0) progress = Math.max(progress, tv.currentProgress);
+          else progress = Math.min(progress, tv.currentProgress);
+        }
 
         const canExtrapolate =
           tv.targetHasServerProgress &&
@@ -409,10 +437,16 @@ export class VehicleLayer {
           elapsed > INTERP_DURATION;
         if (canExtrapolate) {
           const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
-          const bySpeedMeters = (tv.targetSpeed / 3.6) * (extraMs / 1000);
+          const bySpeedMeters = (tv.targetSpeed / 3.6) * EXTRAP_SPEED_FACTOR * (extraMs / 1000);
           const extrapMeters = Math.min(bySpeedMeters, MAX_ROUTE_EXTRAP_METERS);
           const dProgress = geom!.totalDist > 0 ? extrapMeters / geom!.totalDist : 0;
-          progress = tv.targetProgress! + dProgress * travelDir;
+          let baseProgress = routedTargetProgress!;
+          if (tv.currentProgress != null) {
+            baseProgress = travelDir > 0
+              ? Math.max(baseProgress, tv.currentProgress)
+              : Math.min(baseProgress, tv.currentProgress);
+          }
+          progress = baseProgress + dProgress * travelDir;
         }
 
         progress = Math.max(0, Math.min(1, progress));
@@ -441,7 +475,7 @@ export class VehicleLayer {
         ) {
           const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
           const meters = Math.min(
-            (tv.targetSpeed / 3.6) * (extraMs / 1000),
+            (tv.targetSpeed / 3.6) * EXTRAP_SPEED_FACTOR * (extraMs / 1000),
             MAX_ROUTE_EXTRAP_METERS,
           );
           // Extrapolate along observed motion vector (prev -> target), not raw API course.
