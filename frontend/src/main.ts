@@ -73,16 +73,32 @@ async function main() {
 
   // WebSocket connection
   const wsClient = new WsClient();
+  // Do not render potentially stale Redis snapshot on (re)connect.
+  // We show vehicles only after receiving a live `update` frame.
+  let hasFreshVehicleUpdate = false;
 
   wsClient.onStatusChange = (connected) => {
     store.setConnected(connected);
     statusDot.classList.toggle("connected", connected);
     statusText.textContent = connected ? "Онлайн" : "Подключение...";
+
+    if (!connected) {
+      hasFreshVehicleUpdate = false;
+      store.updateVehicles([]);
+    }
   };
 
   wsClient.subscribe((msg) => {
-    // Only update store; the store subscriber handles all rendering
-    store.updateVehicles(msg.vehicles);
+    if (msg.type === "update") {
+      hasFreshVehicleUpdate = true;
+      store.updateVehicles(msg.vehicles);
+      return;
+    }
+
+    // Ignore startup snapshot until first live update arrives.
+    if (hasFreshVehicleUpdate) {
+      store.updateVehicles(msg.vehicles);
+    }
   });
 
   wsClient.connect();

@@ -48,16 +48,9 @@ export class WsClient {
     };
 
     this.ws.onmessage = (ev) => {
-      try {
-        const data: ArrayBuffer = ev.data;
-        const text = new TextDecoder().decode(data);
-        const msg: WsMessage = JSON.parse(text);
-        for (const listener of this.listeners) {
-          listener(msg);
-        }
-      } catch (e) {
+      this.handleMessage(ev.data).catch((e) => {
         console.error("[WS] Parse error:", e);
-      }
+      });
     };
 
     this.ws.onclose = () => {
@@ -82,5 +75,24 @@ export class WsClient {
     if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
     this.ws?.close();
     this.ws = null;
+  }
+
+  private async handleMessage(payload: unknown): Promise<void> {
+    let text: string;
+
+    if (typeof payload === "string") {
+      text = payload;
+    } else if (payload instanceof ArrayBuffer) {
+      text = new TextDecoder().decode(payload);
+    } else if (payload instanceof Blob) {
+      text = await payload.text();
+    } else {
+      throw new Error(`Unsupported WebSocket payload type: ${typeof payload}`);
+    }
+
+    const msg: WsMessage = JSON.parse(text);
+    for (const listener of this.listeners) {
+      listener(msg);
+    }
   }
 }
