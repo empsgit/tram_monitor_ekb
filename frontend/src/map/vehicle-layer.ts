@@ -128,7 +128,6 @@ interface TrackedVehicle {
   targetLat: number;
   targetLon: number;
   targetCourse: number;
-  targetSpeed: number; // km/h
   // Timing
   updateTime: number; // performance.now()
   // Current rendered values
@@ -184,31 +183,74 @@ export class VehicleLayer {
 
       const tv = this.tracked.get(v.id);
       if (tv) {
+        const geom = v.route_id != null ? this.routeGeometries.get(v.route_id) : undefined;
+        const routeChanged = tv.routeId !== v.route_id;
+
         // Snap "previous" to wherever the marker currently is
         tv.prevLat = tv.currentLat;
         tv.prevLon = tv.currentLon;
         tv.prevCourse = tv.currentCourse;
         tv.prevProgress = tv.currentProgress;
 
+        if (routeChanged) {
+          if (geom && v.progress != null) {
+            const p = pointAtProgress(geom, v.progress);
+            const c = bearingAtProgress(geom, v.progress);
+            tv.prevLat = p[0];
+            tv.prevLon = p[1];
+            tv.prevCourse = c;
+            tv.prevProgress = v.progress;
+            tv.currentLat = p[0];
+            tv.currentLon = p[1];
+            tv.currentCourse = c;
+            tv.currentProgress = v.progress;
+            tv.marker.setLatLng([p[0], p[1]]);
+            this.updateHeading(tv.marker, c);
+          } else {
+            tv.prevLat = v.lat;
+            tv.prevLon = v.lon;
+            tv.prevCourse = v.course;
+            tv.prevProgress = v.progress;
+            tv.currentLat = v.lat;
+            tv.currentLon = v.lon;
+            tv.currentCourse = v.course;
+            tv.currentProgress = v.progress;
+            tv.marker.setLatLng([v.lat, v.lon]);
+            this.updateHeading(tv.marker, v.course);
+          }
+        }
+
         // Detect unreasonable progress jumps — snap instead of animating
         if (
+          !routeChanged &&
           tv.prevProgress != null && v.progress != null &&
           Math.abs(v.progress - tv.prevProgress) > MAX_ANIM_PROGRESS_DELTA
         ) {
           // Large jump: teleport to new position immediately.
+          let snapLat = v.lat;
+          let snapLon = v.lon;
+          let snapCourse = v.course;
+          if (geom) {
+            const p = pointAtProgress(geom, v.progress);
+            snapLat = p[0];
+            snapLon = p[1];
+            snapCourse = bearingAtProgress(geom, v.progress);
+          }
           tv.prevProgress = v.progress;
-          tv.prevLat = v.lat;
-          tv.prevLon = v.lon;
-          tv.prevCourse = v.course;
+          tv.prevLat = snapLat;
+          tv.prevLon = snapLon;
+          tv.prevCourse = snapCourse;
           tv.currentProgress = v.progress;
-          tv.currentLat = v.lat;
-          tv.currentLon = v.lon;
-          tv.currentCourse = v.course;
+          tv.currentLat = snapLat;
+          tv.currentLon = snapLon;
+          tv.currentCourse = snapCourse;
+          tv.marker.setLatLng([snapLat, snapLon]);
+          this.updateHeading(tv.marker, snapCourse);
         }
 
         // If route geometry exists but server rejected snap (progress=null),
         // keep the current routed position instead of drifting off-route.
-        const hasGeom = v.route_id != null && this.routeGeometries.has(v.route_id);
+        const hasGeom = !!geom;
         const targetProgress = hasGeom && v.progress == null && tv.currentProgress != null
           ? tv.currentProgress
           : v.progress;
@@ -217,7 +259,6 @@ export class VehicleLayer {
         tv.targetLat = v.lat;
         tv.targetLon = v.lon;
         tv.targetCourse = v.course;
-        tv.targetSpeed = v.speed;
         tv.targetProgress = targetProgress;
         tv.routeId = v.route_id;
         tv.updateTime = now;
@@ -261,7 +302,6 @@ export class VehicleLayer {
           targetLat: v.lat,
           targetLon: v.lon,
           targetCourse: v.course,
-          targetSpeed: v.speed,
           updateTime: now,
           currentLat: initialLat,
           currentLon: initialLon,
@@ -284,7 +324,7 @@ export class VehicleLayer {
    * Runs every animation frame (~60 fps).
    *
    * If the vehicle has progress + route geometry, it follows the route polyline.
-   * Otherwise falls back to linear lat/lon interpolation + dead-reckoning.
+   * Otherwise falls back to linear lat/lon interpolation.
    */
   private interpolateAll(): void {
     const now = performance.now();
