@@ -42,8 +42,7 @@ function createIcon(routeNum: string, signalLost = false): L.DivIcon {
 }
 
 // --- Animation constants ---
-const INTERP_DURATION = 1800; // ms — converge quickly to latest server point to avoid visual lag
-const MAX_EXTRAP_MS = 5000;    // ms — extrapolate up to 5s beyond target
+const INTERP_DURATION = 9500; // ms — close to backend poll interval (10s)
 const DEG2RAD = Math.PI / 180;
 const M_PER_DEG_LAT = 111320;
 
@@ -139,6 +138,10 @@ interface TrackedVehicle {
   currentProgress: number | null;
 }
 
+function easeOutQuad(t: number): number {
+  return t * (2 - t);
+}
+
 export class VehicleLayer {
   private tracked: Map<string, TrackedVehicle> = new Map();
   private layerGroup: L.LayerGroup;
@@ -149,6 +152,7 @@ export class VehicleLayer {
 
   constructor(map: L.Map) {
     this.layerGroup = L.layerGroup().addTo(map);
+    this.startAnimation();
   }
 
   /** Load route geometries for route-following animation. */
@@ -191,27 +195,32 @@ export class VehicleLayer {
           tv.prevProgress != null && v.progress != null &&
           Math.abs(v.progress - tv.prevProgress) > MAX_ANIM_PROGRESS_DELTA
         ) {
-          // Large jump: teleport to new position immediately
+          // Large jump: teleport to new position immediately.
           tv.prevProgress = v.progress;
           tv.prevLat = v.lat;
           tv.prevLon = v.lon;
           tv.prevCourse = v.course;
+          tv.currentProgress = v.progress;
+          tv.currentLat = v.lat;
+          tv.currentLon = v.lon;
+          tv.currentCourse = v.course;
         }
 
-        // Set new target and render immediately (no smoothing/interpolation).
+        // If route geometry exists but server rejected snap (progress=null),
+        // keep the current routed position instead of drifting off-route.
+        const hasGeom = v.route_id != null && this.routeGeometries.has(v.route_id);
+        const targetProgress = hasGeom && v.progress == null && tv.currentProgress != null
+          ? tv.currentProgress
+          : v.progress;
+
+        // Set new target (rendering happens in RAF interpolation loop).
         tv.targetLat = v.lat;
         tv.targetLon = v.lon;
         tv.targetCourse = v.course;
         tv.targetSpeed = v.speed;
-        tv.targetProgress = v.progress;
+        tv.targetProgress = targetProgress;
         tv.routeId = v.route_id;
         tv.updateTime = now;
-        tv.marker.setLatLng([v.lat, v.lon]);
-        tv.currentLat = v.lat;
-        tv.currentLon = v.lon;
-        this.updateHeading(tv.marker, v.course);
-        tv.currentCourse = v.course;
-        tv.currentProgress = v.progress;
 
         if (tv.route !== v.route || tv.signalLost !== v.signal_lost) {
           tv.marker.setIcon(createIcon(v.route, v.signal_lost));
@@ -220,13 +229,24 @@ export class VehicleLayer {
         }
         tv.marker.setPopupContent(this.popupHtml(v));
       } else {
-        const marker = L.marker([v.lat, v.lon], {
+        let initialLat = v.lat;
+        let initialLon = v.lon;
+        let initialCourse = v.course;
+        const geom = v.route_id != null ? this.routeGeometries.get(v.route_id) : undefined;
+        if (geom && v.progress != null) {
+          const p = pointAtProgress(geom, v.progress);
+          initialLat = p[0];
+          initialLon = p[1];
+          initialCourse = bearingAtProgress(geom, v.progress);
+        }
+
+        const marker = L.marker([initialLat, initialLon], {
           icon: createIcon(v.route, v.signal_lost),
           zIndexOffset: 100,
         });
         marker.bindPopup(this.popupHtml(v));
         marker.addTo(this.layerGroup);
-        this.updateHeading(marker, v.course);
+        this.updateHeading(marker, initialCourse);
 
         this.tracked.set(v.id, {
           marker,
@@ -235,17 +255,17 @@ export class VehicleLayer {
           signalLost: v.signal_lost,
           prevProgress: v.progress,
           targetProgress: v.progress,
-          prevLat: v.lat,
-          prevLon: v.lon,
-          prevCourse: v.course,
+          prevLat: initialLat,
+          prevLon: initialLon,
+          prevCourse: initialCourse,
           targetLat: v.lat,
           targetLon: v.lon,
           targetCourse: v.course,
           targetSpeed: v.speed,
           updateTime: now,
-          currentLat: v.lat,
-          currentLon: v.lon,
-          currentCourse: v.course,
+          currentLat: initialLat,
+          currentLon: initialLon,
+          currentCourse: initialCourse,
           currentProgress: v.progress,
         });
       }
@@ -267,7 +287,52 @@ export class VehicleLayer {
    * Otherwise falls back to linear lat/lon interpolation + dead-reckoning.
    */
   private interpolateAll(): void {
-    // Intentionally disabled: markers jump to latest points immediately.
+    const now = performance.now();
+
+    for (const [, tv] of this.tracked) {
+      const elapsed = Math.max(0, now - tv.updateTime);
+      const t = Math.min(1, elapsed / INTERP_DURATION);
+      const easedT = easeOutQuad(t);
+
+      let lat: number;
+      let lon: number;
+      let course: number;
+
+      const geom = tv.routeId != null ? this.routeGeometries.get(tv.routeId) : undefined;
+      const useRoutedAnimation = geom && tv.prevProgress != null && tv.targetProgress != null;
+
+      if (useRoutedAnimation) {
+        const progress =
+          tv.prevProgress! + (tv.targetProgress! - tv.prevProgress!) * easedT;
+        const pos = pointAtProgress(geom!, progress);
+        lat = pos[0];
+        lon = pos[1];
+        course = bearingAtProgress(geom!, progress);
+        if (tv.targetProgress! < tv.prevProgress!) {
+          course = (course + 180) % 360;
+        }
+        tv.currentProgress = progress;
+      } else {
+        lat = tv.prevLat + (tv.targetLat - tv.prevLat) * easedT;
+        lon = tv.prevLon + (tv.targetLon - tv.prevLon) * easedT;
+        course = lerpAngle(tv.prevCourse, tv.targetCourse, easedT);
+        tv.currentProgress = tv.targetProgress;
+      }
+
+      if (
+        Math.abs(lat - tv.currentLat) > 0.0000005 ||
+        Math.abs(lon - tv.currentLon) > 0.0000005
+      ) {
+        tv.marker.setLatLng([lat, lon]);
+        tv.currentLat = lat;
+        tv.currentLon = lon;
+      }
+
+      if (Math.abs(course - tv.currentCourse) > 0.3) {
+        this.updateHeading(tv.marker, course);
+        tv.currentCourse = course;
+      }
+    }
   }
 
   private updateHeading(marker: L.Marker, course: number): void {
