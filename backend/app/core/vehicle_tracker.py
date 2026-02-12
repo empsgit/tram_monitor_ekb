@@ -349,11 +349,13 @@ class VehicleTracker:
         # Compute bearing from recent movement
         # Only use movement bearing if the vehicle has actually moved significantly
         movement_bearing = None
+        movement_dist_m = 0.0
         if len(positions) >= 2:
             p_old, p_new = positions[0], positions[-1]
             dlat_m = (p_new[0] - p_old[0]) * LAT_M_PER_DEG
             dlon_m = (p_new[1] - p_old[1]) * LON_M_PER_DEG
             dist_m = math.sqrt(dlat_m * dlat_m + dlon_m * dlon_m)
+            movement_dist_m = dist_m
             if dist_m > 30:  # Moved at least 30m — reliable bearing
                 movement_bearing = math.degrees(math.atan2(dlon_m, dlat_m)) % 360
             elif rv.speed > 5:  # API reports moving but GPS jitter hides it
@@ -432,9 +434,10 @@ class VehicleTracker:
                         })
                         bounded_progress = min(max(raw_progress, lo), hi)
 
-            # Enforce forward movement within selected direction.
+            # Enforce forward movement only when we actually observed movement.
             prev_progress = prev.get("progress") if prev and prev.get("route_id") == route_id else None
-            if prev_progress is not None:
+            enforce_forward = movement_dist_m > 20 or rv.speed > 5
+            if enforce_forward and prev_progress is not None:
                 if direction == 0 and bounded_progress + 0.001 < prev_progress:
                     logger.warning(
                         "Vehicle %s route %s: backward projection %.3f -> %.3f (dir=0)",
@@ -462,10 +465,26 @@ class VehicleTracker:
                     })
                     bounded_progress = prev_progress
 
-            state.progress = bounded_progress
             snapped = self.route_matcher.interpolate_progress(route_id, bounded_progress)
             if snapped:
-                state.lat, state.lon = snapped
+                snap_error_m = _haversine(rv.lat, rv.lon, snapped[0], snapped[1])
+                MAX_FINAL_SNAP_ERROR_M = 80.0
+                if snap_error_m <= MAX_FINAL_SNAP_ERROR_M:
+                    state.progress = bounded_progress
+                    state.lat, state.lon = snapped
+                else:
+                    state.progress = None
+                    self._log_projection_event("snap_rejected_error", {
+                        "vehicle_id": rv.dev_id,
+                        "route_id": route_id,
+                        "snap_error_m": round(snap_error_m, 2),
+                        "raw_lat": rv.lat,
+                        "raw_lon": rv.lon,
+                        "snap_lat": round(snapped[0], 6),
+                        "snap_lon": round(snapped[1], 6),
+                    })
+            else:
+                state.progress = None
         else:
             state.progress = None
             if match:
