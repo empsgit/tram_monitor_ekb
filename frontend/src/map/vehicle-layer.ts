@@ -388,11 +388,14 @@ export class VehicleLayer {
       const useRoutedAnimation = geom && tv.prevProgress != null && tv.targetProgress != null;
 
       if (useRoutedAnimation) {
+        // ETTU course is visually offset by 90deg in this project;
+        // normalize it for motion math (travel direction inference).
+        const motionCourse = (tv.targetCourse - 90 + 360) % 360;
         const travelDir = inferTravelDir(
           geom!,
           tv.prevProgress!,
           tv.targetProgress!,
-          tv.targetCourse,
+          motionCourse,
         );
         let progress =
           tv.prevProgress! + (tv.targetProgress! - tv.prevProgress!) * easedT;
@@ -436,11 +439,13 @@ export class VehicleLayer {
             (tv.targetSpeed / 3.6) * (extraMs / 1000),
             MAX_ROUTE_EXTRAP_METERS,
           );
-          const cRad = tv.targetCourse * DEG2RAD;
+          // Use normalized course for extrapolation to avoid sideways drift.
+          const motionCourse = (tv.targetCourse - 90 + 360) % 360;
+          const cRad = motionCourse * DEG2RAD;
           const cosLat = Math.cos(tv.targetLat * DEG2RAD);
           lat = tv.targetLat + (meters * Math.cos(cRad)) / M_PER_DEG_LAT;
           lon = tv.targetLon + (meters * Math.sin(cRad)) / (M_PER_DEG_LAT * cosLat);
-          course = tv.targetCourse;
+          course = motionCourse;
         }
 
         tv.currentProgress = tv.targetProgress;
