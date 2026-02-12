@@ -462,7 +462,7 @@ class VehicleTracker:
                     })
                     bounded_progress = prev_progress
 
-            state.progress = smoothed
+            state.progress = bounded_progress
             # Do NOT snap lat/lon — use raw GPS from API
         else:
             state.progress = None
