@@ -42,7 +42,7 @@ function createIcon(routeNum: string, signalLost = false): L.DivIcon {
 }
 
 // --- Animation constants ---
-const INTERP_DURATION = 10000; // ms — matches server poll interval
+const INTERP_DURATION = 1800; // ms — converge quickly to latest server point to avoid visual lag
 const MAX_EXTRAP_MS = 5000;    // ms — extrapolate up to 5s beyond target
 const DEG2RAD = Math.PI / 180;
 const M_PER_DEG_LAT = 111320;
@@ -51,9 +51,6 @@ const M_PER_DEG_LAT = 111320;
 // Anything larger is a GPS glitch or direction change — snap instantly.
 const MAX_ANIM_PROGRESS_DELTA = 0.05;
 
-// Trail: ~80m max, fading out
-const TRAIL_MAX_DIST_M = 80;
-const TRAIL_SEGMENT_COUNT = 6; // number of gradient segments
 
 /** Interpolate between two angles via the shortest arc. */
 function lerpAngle(from: number, to: number, t: number): number {
@@ -117,14 +114,6 @@ function bearingAtProgress(geom: RouteGeometry, progress: number): number {
   return (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
 }
 
-/** Distance in meters between two [lat, lon] points. */
-function distM(a: [number, number], b: [number, number]): number {
-  const dlat = (b[0] - a[0]) * M_PER_DEG_LAT;
-  const cosLat = Math.cos(a[0] * DEG2RAD);
-  const dlon = (b[1] - a[1]) * M_PER_DEG_LAT * cosLat;
-  return Math.sqrt(dlat * dlat + dlon * dlon);
-}
-
 interface TrackedVehicle {
   marker: L.Marker;
   route: string;
@@ -152,17 +141,13 @@ interface TrackedVehicle {
 
 export class VehicleLayer {
   private tracked: Map<string, TrackedVehicle> = new Map();
-  private trailPoints: Map<string, [number, number][]> = new Map();
-  private trailLines: Map<string, L.Polyline[]> = new Map();
   private layerGroup: L.LayerGroup;
-  private trailGroup: L.LayerGroup;
   private rafId: number = 0;
 
   // Route geometry index for progress → position lookup
   private routeGeometries: Map<number, RouteGeometry> = new Map();
 
   constructor(map: L.Map) {
-    this.trailGroup = L.layerGroup().addTo(map);
     this.layerGroup = L.layerGroup().addTo(map);
     this.startAnimation();
   }
@@ -186,14 +171,13 @@ export class VehicleLayer {
     this.rafId = requestAnimationFrame(animate);
   }
 
-  /** Called on each server update (~10 s). Stores targets, creates/removes markers, updates trails. */
+  /** Called on each server update (~10 s). Stores targets and creates/removes markers. */
   update(vehicles: VehicleData[]): void {
     const now = performance.now();
     const seen = new Set<string>();
 
     for (const v of vehicles) {
       seen.add(v.id);
-      this.updateTrail(v);
 
       const tv = this.tracked.get(v.id);
       if (tv) {
@@ -262,17 +246,11 @@ export class VehicleLayer {
       }
     }
 
-    // Remove stale markers and trails
+    // Remove stale markers
     for (const [id, tv] of this.tracked) {
       if (!seen.has(id)) {
         this.layerGroup.removeLayer(tv.marker);
         this.tracked.delete(id);
-        const segments = this.trailLines.get(id);
-        if (segments) {
-          for (const seg of segments) this.trailGroup.removeLayer(seg);
-          this.trailLines.delete(id);
-        }
-        this.trailPoints.delete(id);
       }
     }
   }
@@ -362,71 +340,6 @@ export class VehicleLayer {
     }
   }
 
-  /** Update trail: keep points within TRAIL_MAX_DIST_M, render as fading gradient. */
-  private updateTrail(v: VehicleData): void {
-    const pts = this.trailPoints.get(v.id) || [];
-    const newPt: [number, number] = [v.lat, v.lon];
-    const last = pts[pts.length - 1];
-
-    if (!last || distM(last, newPt) > 2) {
-      pts.push(newPt);
-    }
-
-    // Trim from the back to stay within max trail distance
-    let totalDist = 0;
-    let keepFrom = pts.length - 1;
-    for (let i = pts.length - 1; i > 0; i--) {
-      totalDist += distM(pts[i - 1], pts[i]);
-      if (totalDist > TRAIL_MAX_DIST_M) {
-        keepFrom = i;
-        break;
-      }
-      keepFrom = i - 1;
-    }
-    const trimmed = pts.slice(keepFrom);
-    this.trailPoints.set(v.id, trimmed);
-
-    // Remove old trail segments
-    const oldSegs = this.trailLines.get(v.id);
-    if (oldSegs) {
-      for (const seg of oldSegs) this.trailGroup.removeLayer(seg);
-    }
-
-    if (trimmed.length < 2) {
-      this.trailLines.delete(v.id);
-      return;
-    }
-
-    // Build gradient trail: split into segments with decreasing opacity
-    const color = routeColor(v.route);
-    const segments: L.Polyline[] = [];
-    const segCount = Math.min(TRAIL_SEGMENT_COUNT, trimmed.length - 1);
-    const ptsPerSeg = Math.max(1, Math.floor((trimmed.length - 1) / segCount));
-
-    for (let s = 0; s < segCount; s++) {
-      const startIdx = s * ptsPerSeg;
-      const endIdx = s === segCount - 1 ? trimmed.length - 1 : (s + 1) * ptsPerSeg;
-      if (startIdx >= trimmed.length - 1) break;
-
-      const segPts = trimmed.slice(startIdx, endIdx + 1);
-      // Oldest segment (s=0) is most faded; newest (s=segCount-1) is brightest
-      const opacity = 0.15 + 0.55 * ((s + 1) / segCount);
-      const weight = 3 + 2 * ((s + 1) / segCount);
-
-      const polyline = L.polyline(segPts, {
-        color,
-        weight,
-        opacity,
-        lineCap: "round",
-        lineJoin: "round",
-      });
-      polyline.addTo(this.trailGroup);
-      segments.push(polyline);
-    }
-
-    this.trailLines.set(v.id, segments);
-  }
-
   private updateHeading(marker: L.Marker, course: number): void {
     const el = (marker as any)._icon as HTMLElement | undefined;
     if (!el) return;
@@ -468,9 +381,6 @@ export class VehicleLayer {
   clear(): void {
     cancelAnimationFrame(this.rafId);
     this.layerGroup.clearLayers();
-    this.trailGroup.clearLayers();
     this.tracked.clear();
-    this.trailPoints.clear();
-    this.trailLines.clear();
   }
 }
