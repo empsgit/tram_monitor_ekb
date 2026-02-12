@@ -42,7 +42,7 @@ function createIcon(routeNum: string, signalLost = false): L.DivIcon {
 }
 
 // --- Animation constants ---
-const INTERP_DURATION = 10000; // ms — matches server poll interval
+const INTERP_DURATION = 1800; // ms — converge quickly to latest server point to avoid visual lag
 const MAX_EXTRAP_MS = 5000;    // ms — extrapolate up to 5s beyond target
 const DEG2RAD = Math.PI / 180;
 const M_PER_DEG_LAT = 111320;

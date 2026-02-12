@@ -392,16 +392,17 @@ class VehicleTracker:
         if match:
             raw_progress = match.progress
 
-            # Keep animation smooth, but never let smoothing pull a tram too far from GPS.
-            MAX_DELTA = 0.05
+            # Keep progress stable, but favor freshness to avoid delayed display.
+            # High alpha reduces lag; larger delta cap allows catching up after sparse updates.
+            SMOOTH_ALPHA = 0.8
+            MAX_DELTA = 0.15
             MAX_SNAP_ERROR_M = 120.0
             prev_progress = None
             if prev and prev["route_id"] == route_id:
                 prev_progress = prev.get("progress")
 
             if prev_progress is not None and prev and prev["direction"] == direction:
-                alpha = 0.4
-                smoothed = prev_progress * (1 - alpha) + raw_progress * alpha
+                smoothed = prev_progress * (1 - SMOOTH_ALPHA) + raw_progress * SMOOTH_ALPHA
                 if direction == 0:
                     smoothed = max(smoothed, prev_progress)
                 else:
