@@ -243,6 +243,23 @@ export class VehicleLayer {
           }
         }
 
+        // Bootstrap routed animation when progress becomes available after being null.
+        // Without this, one interpolation cycle uses raw GPS lat/lon and can drift off-route.
+        if (!routeChanged && geom && v.progress != null && tv.currentProgress == null) {
+          const p = pointAtProgress(geom, v.progress);
+          const c = bearingAtProgress(geom, v.progress);
+          tv.prevProgress = v.progress;
+          tv.prevLat = p[0];
+          tv.prevLon = p[1];
+          tv.prevCourse = c;
+          tv.currentProgress = v.progress;
+          tv.currentLat = p[0];
+          tv.currentLon = p[1];
+          tv.currentCourse = c;
+          tv.marker.setLatLng([p[0], p[1]]);
+          this.updateHeading(tv.marker, c);
+        }
+
         // Detect unreasonable progress jumps — snap instead of animating
         if (
           !routeChanged &&
