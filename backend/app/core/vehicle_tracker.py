@@ -401,7 +401,7 @@ class VehicleTracker:
         # --- Route matching (for progress tracking only, NOT for position) ---
         # We keep progress for potential animation use but NEVER override
         # the real GPS coordinates — the ETTU API positions are accurate.
-        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing)
+        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing or rv.course)
         if match:
             raw_progress = match.progress
 
