@@ -100,11 +100,11 @@ class StopDetector:
         course: float | None = None, max_next: int = 5,
         preferred_direction: int | None = None,
     ) -> DetectionResult:
-        """Find vehicle's position on route using GPS proximity and stop sequence.
+        """Find vehicle's section by nearest stop + directional probe comparison.
 
-        Tries all directions, picks the best match. Uses course as a tiebreaker
-        when segments in different directions are similarly close.
-        preferred_direction adds a penalty for switching to maintain consistency.
+        For each route direction, choose nearest stop; then compare distances to two
+        equal probes placed toward previous and next stops. This decides whether the
+        vehicle is before stop, after stop, or effectively at stop.
         """
         if route_id not in self._stops:
             return DetectionResult(prev_stop=None, next_stops=[], direction=0)
@@ -116,33 +116,32 @@ class StopDetector:
             if not stops:
                 continue
 
-            seg_idx, seg_dist_sq = self._find_nearest_segment(stops, lat, lon)
+            closest_idx, closest_dist = self._find_nearest_stop(stops, lat, lon)
+            score = closest_dist * closest_dist
 
-            # Course-based penalty: if vehicle heading opposes segment direction,
-            # penalise this direction so the other one wins.
-            score = seg_dist_sq
-            if course is not None and seg_idx < len(stops) - 1:
+            # Course-based penalty against route direction near closest stop.
+            if course is not None and len(stops) > 1:
+                seg_from = max(0, min(closest_idx, len(stops) - 2))
                 seg_bear = _segment_bearing(
-                    stops[seg_idx].lat, stops[seg_idx].lon,
-                    stops[seg_idx + 1].lat, stops[seg_idx + 1].lon,
+                    stops[seg_from].lat, stops[seg_from].lon,
+                    stops[seg_from + 1].lat, stops[seg_from + 1].lon,
                 )
                 diff = abs(course - seg_bear) % 360
                 if diff > 180:
                     diff = 360 - diff
                 if diff > 90:
-                    score += 500_000  # ~707m equivalent penalty (strong)
+                    score += 500_000
 
-            # Preferred direction: penalize switching to maintain consistency
             if preferred_direction is not None and d != preferred_direction:
-                score += 200_000  # ~447m equivalent penalty
+                score += 200_000
+
+            prev_idx = self._infer_prev_stop_index(stops, closest_idx, lat, lon)
+            next_list = stops[prev_idx + 1: prev_idx + 1 + max_next]
 
             if score < best_score:
                 best_score = score
-                prev_stop = stops[seg_idx]
-                next_list = stops[seg_idx + 1: seg_idx + 1 + max_next]
-
                 best = DetectionResult(
-                    prev_stop=prev_stop,
+                    prev_stop=stops[prev_idx] if stops else None,
                     next_stops=next_list,
                     direction=d,
                 )
@@ -150,6 +149,69 @@ class StopDetector:
         return best or DetectionResult(prev_stop=None, next_stops=[], direction=0)
 
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_nearest_stop(stops: list[StopOnRoute], lat: float, lon: float) -> tuple[int, float]:
+        if not stops:
+            return 0, float("inf")
+        best_idx = 0
+        best_dist = float("inf")
+        for i, s in enumerate(stops):
+            d = _gps_dist_m(lat, lon, s.lat, s.lon)
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        return best_idx, best_dist
+
+    @staticmethod
+    def _interp(a: StopOnRoute, b: StopOnRoute, t: float) -> tuple[float, float]:
+        return (a.lat + (b.lat - a.lat) * t, a.lon + (b.lon - a.lon) * t)
+
+    @classmethod
+    def _infer_prev_stop_index(
+        cls,
+        stops: list[StopOnRoute],
+        closest_idx: int,
+        lat: float,
+        lon: float,
+    ) -> int:
+        """Infer whether vehicle is before/at/after nearest stop using equal probes."""
+        if not stops:
+            return 0
+        if len(stops) == 1:
+            return 0
+
+        curr = stops[closest_idx]
+        has_prev = closest_idx > 0
+        has_next = closest_idx < len(stops) - 1
+
+        if not has_prev and has_next:
+            return 0
+        if has_prev and not has_next:
+            return len(stops) - 2
+        if not has_prev and not has_next:
+            return 0
+
+        prev_stop = stops[closest_idx - 1]
+        next_stop = stops[closest_idx + 1]
+        d_prev = _gps_dist_m(curr.lat, curr.lon, prev_stop.lat, prev_stop.lon)
+        d_next = _gps_dist_m(curr.lat, curr.lon, next_stop.lat, next_stop.lon)
+        probe_m = max(5.0, min(d_prev, d_next) * 0.35)
+
+        t_prev = min(1.0, probe_m / max(d_prev, 1e-6))
+        t_next = min(1.0, probe_m / max(d_next, 1e-6))
+        prev_probe = cls._interp(curr, prev_stop, t_prev)
+        next_probe = cls._interp(curr, next_stop, t_next)
+
+        dist_to_prev_probe = _gps_dist_m(lat, lon, prev_probe[0], prev_probe[1])
+        dist_to_next_probe = _gps_dist_m(lat, lon, next_probe[0], next_probe[1])
+        eps = 5.0
+
+        if abs(dist_to_prev_probe - dist_to_next_probe) <= eps:
+            return closest_idx
+        if dist_to_next_probe < dist_to_prev_probe:
+            return closest_idx
+        return max(0, closest_idx - 1)
 
     @staticmethod
     def _find_nearest_segment(
