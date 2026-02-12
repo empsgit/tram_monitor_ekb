@@ -445,7 +445,7 @@ class VehicleTracker:
             enforce_forward = movement_dist_m > 20 or rv.speed > 5
             if enforce_forward and prev_progress is not None:
                 if direction == 0 and bounded_progress + 0.001 < prev_progress:
-                    logger.warning(
+                    logger.debug(
                         "Vehicle %s route %s: backward projection %.3f -> %.3f (dir=0)",
                         rv.dev_id, route_id, prev_progress, bounded_progress,
                     )
@@ -458,7 +458,7 @@ class VehicleTracker:
                     })
                     bounded_progress = prev_progress
                 elif direction == 1 and bounded_progress - 0.001 > prev_progress:
-                    logger.warning(
+                    logger.debug(
                         "Vehicle %s route %s: backward projection %.3f -> %.3f (dir=1)",
                         rv.dev_id, route_id, prev_progress, bounded_progress,
                     )
