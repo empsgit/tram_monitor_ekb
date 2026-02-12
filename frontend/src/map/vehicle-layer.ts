@@ -42,7 +42,10 @@ function createIcon(routeNum: string, signalLost = false): L.DivIcon {
 }
 
 // --- Animation constants ---
-const INTERP_DURATION = 9500; // ms — close to backend poll interval (10s)
+const INTERP_DURATION = 1200; // ms — quickly converge to latest server point
+const MAX_EXTRAP_MS = 12000; // ms — capped route extrapolation between updates
+const MAX_ROUTE_EXTRAP_METERS = 140; // hard cap to prevent visible drift
+const MIN_MOVING_SPEED_KMH = 3;
 const DEG2RAD = Math.PI / 180;
 const M_PER_DEG_LAT = 111320;
 
@@ -128,6 +131,8 @@ interface TrackedVehicle {
   targetLat: number;
   targetLon: number;
   targetCourse: number;
+  targetSpeed: number; // km/h
+  targetHasServerProgress: boolean;
   // Timing
   updateTime: number; // performance.now()
   // Current rendered values
@@ -139,6 +144,24 @@ interface TrackedVehicle {
 
 function easeOutQuad(t: number): number {
   return t * (2 - t);
+}
+
+function absAngleDiffDeg(a: number, b: number): number {
+  const diff = Math.abs(a - b) % 360;
+  return diff > 180 ? 360 - diff : diff;
+}
+
+function inferTravelDir(
+  geom: RouteGeometry,
+  prevProgress: number,
+  targetProgress: number,
+  targetCourse: number,
+): number {
+  if (Math.abs(targetProgress - prevProgress) > 0.0001) {
+    return targetProgress >= prevProgress ? 1 : -1;
+  }
+  const routeBearing = bearingAtProgress(geom, targetProgress);
+  return absAngleDiffDeg(targetCourse, routeBearing) > 90 ? -1 : 1;
 }
 
 export class VehicleLayer {
@@ -254,12 +277,15 @@ export class VehicleLayer {
         const targetProgress = hasGeom && v.progress == null && tv.currentProgress != null
           ? tv.currentProgress
           : v.progress;
+        const targetHasServerProgress = v.progress != null;
 
         // Set new target (rendering happens in RAF interpolation loop).
         tv.targetLat = v.lat;
         tv.targetLon = v.lon;
         tv.targetCourse = v.course;
+        tv.targetSpeed = v.speed;
         tv.targetProgress = targetProgress;
+        tv.targetHasServerProgress = targetHasServerProgress;
         tv.routeId = v.route_id;
         tv.updateTime = now;
 
@@ -302,6 +328,8 @@ export class VehicleLayer {
           targetLat: v.lat,
           targetLon: v.lon,
           targetCourse: v.course,
+          targetSpeed: v.speed,
+          targetHasServerProgress: v.progress != null,
           updateTime: now,
           currentLat: initialLat,
           currentLon: initialLon,
@@ -323,7 +351,8 @@ export class VehicleLayer {
   /**
    * Runs every animation frame (~60 fps).
    *
-   * If the vehicle has progress + route geometry, it follows the route polyline.
+   * If the vehicle has progress + route geometry, it follows the route polyline
+   * and extrapolates in a tightly capped window until the next backend update.
    * Otherwise falls back to linear lat/lon interpolation.
    */
   private interpolateAll(): void {
@@ -342,13 +371,34 @@ export class VehicleLayer {
       const useRoutedAnimation = geom && tv.prevProgress != null && tv.targetProgress != null;
 
       if (useRoutedAnimation) {
-        const progress =
+        const travelDir = inferTravelDir(
+          geom!,
+          tv.prevProgress!,
+          tv.targetProgress!,
+          tv.targetCourse,
+        );
+        let progress =
           tv.prevProgress! + (tv.targetProgress! - tv.prevProgress!) * easedT;
+
+        const canExtrapolate =
+          tv.targetHasServerProgress &&
+          !tv.signalLost &&
+          tv.targetSpeed >= MIN_MOVING_SPEED_KMH &&
+          elapsed > INTERP_DURATION;
+        if (canExtrapolate) {
+          const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
+          const bySpeedMeters = (tv.targetSpeed / 3.6) * (extraMs / 1000);
+          const extrapMeters = Math.min(bySpeedMeters, MAX_ROUTE_EXTRAP_METERS);
+          const dProgress = geom!.totalDist > 0 ? extrapMeters / geom!.totalDist : 0;
+          progress = tv.targetProgress! + dProgress * travelDir;
+        }
+
+        progress = Math.max(0, Math.min(1, progress));
         const pos = pointAtProgress(geom!, progress);
         lat = pos[0];
         lon = pos[1];
         course = bearingAtProgress(geom!, progress);
-        if (tv.targetProgress! < tv.prevProgress!) {
+        if (travelDir < 0) {
           course = (course + 180) % 360;
         }
         tv.currentProgress = progress;
