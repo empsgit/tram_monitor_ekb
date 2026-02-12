@@ -40,7 +40,7 @@ class RouteMatcher:
         total_m = self._line_length_meters(coords)
         self._routes[route_id] = (line, total_m)
 
-    def match(self, route_id: int, lat: float, lon: float, course: float = 0.0) -> MatchResult | None:
+    def match(self, route_id: int, lat: float, lon: float, course: float | None = 0.0) -> MatchResult | None:
         """Snap a point to a route, returning progress and distance."""
         if route_id not in self._routes:
             return None
@@ -83,7 +83,7 @@ class RouteMatcher:
         pt = line.interpolate(max(0.0, min(1.0, progress)), normalized=True)
         return (pt.y, pt.x)  # (lat, lon)
 
-    def _infer_direction(self, line: LineString, progress: float, course: float) -> int:
+    def _infer_direction(self, line: LineString, progress: float, course: float | None) -> int:
         """Compare vehicle heading with route bearing to infer direction."""
         if progress < 0.01 or progress > 0.99:
             return 0
@@ -92,7 +92,9 @@ class RouteMatcher:
         p2 = line.interpolate(min(1, progress + 0.005), normalized=True)
         route_bearing = math.degrees(math.atan2(p2.x - p1.x, p2.y - p1.y)) % 360
 
-        # Compare with vehicle course
+        # Compare with vehicle course; if unknown keep default forward direction.
+        if course is None:
+            return 0
         diff = abs(course - route_bearing) % 360
         if diff > 180:
             diff = 360 - diff
