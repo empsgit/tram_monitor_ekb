@@ -24,11 +24,11 @@ export class StopLayer {
     for (const stop of stops) {
       const marker = L.circleMarker([stop.lat, stop.lon], {
         pane: STOP_PANE,
-        radius: 6,
+        radius: 4,
         fillColor: "#60a5fa",
         fillOpacity: 0.9,
         color: "white",
-        weight: 1.5,
+        weight: 1.2,
       });
 
       const label = stop.direction
@@ -56,7 +56,7 @@ export class StopLayer {
   setDimming(activeStopIds: Set<number> | null): void {
     for (const [id, m] of this.markers) {
       if (activeStopIds === null || activeStopIds.has(id)) {
-        m.setStyle({ fillOpacity: 0.9, radius: 6, fillColor: "#60a5fa" });
+        m.setStyle({ fillOpacity: 0.9, radius: 4, fillColor: "#60a5fa" });
       } else {
         m.setStyle({ fillOpacity: 0.15, radius: 3, fillColor: "#94a3b8" });
       }
@@ -66,12 +66,12 @@ export class StopLayer {
   highlightStop(stopId: number): void {
     // Reset all to default (dimming will be re-applied by caller)
     for (const [, m] of this.markers) {
-      m.setStyle({ radius: 6, fillColor: "#60a5fa", weight: 1.5 });
+      m.setStyle({ radius: 4, fillColor: "#60a5fa", weight: 1.5 });
     }
     const selected = this.markers.get(stopId);
     if (selected) {
       selected.setStyle({
-        radius: 10,
+        radius: 7,
         fillColor: "#e94560",
         fillOpacity: 1,
         weight: 3,

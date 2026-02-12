@@ -42,8 +42,10 @@ function createIcon(routeNum: string, signalLost = false): L.DivIcon {
 }
 
 // --- Animation constants ---
-const INTERP_DURATION = 10000; // ms — matches server poll interval
-const MAX_EXTRAP_MS = 5000;    // ms — extrapolate up to 5s beyond target
+const INTERP_DURATION = 1200; // ms — quickly converge to latest server point
+const MAX_EXTRAP_MS = 12000; // ms — capped route extrapolation between updates
+const MAX_ROUTE_EXTRAP_METERS = 140; // hard cap to prevent visible drift
+const MIN_MOVING_SPEED_KMH = 3;
 const DEG2RAD = Math.PI / 180;
 const M_PER_DEG_LAT = 111320;
 
@@ -51,9 +53,6 @@ const M_PER_DEG_LAT = 111320;
 // Anything larger is a GPS glitch or direction change — snap instantly.
 const MAX_ANIM_PROGRESS_DELTA = 0.05;
 
-// Trail: ~80m max, fading out
-const TRAIL_MAX_DIST_M = 80;
-const TRAIL_SEGMENT_COUNT = 6; // number of gradient segments
 
 /** Interpolate between two angles via the shortest arc. */
 function lerpAngle(from: number, to: number, t: number): number {
@@ -117,14 +116,6 @@ function bearingAtProgress(geom: RouteGeometry, progress: number): number {
   return (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
 }
 
-/** Distance in meters between two [lat, lon] points. */
-function distM(a: [number, number], b: [number, number]): number {
-  const dlat = (b[0] - a[0]) * M_PER_DEG_LAT;
-  const cosLat = Math.cos(a[0] * DEG2RAD);
-  const dlon = (b[1] - a[1]) * M_PER_DEG_LAT * cosLat;
-  return Math.sqrt(dlat * dlat + dlon * dlon);
-}
-
 interface TrackedVehicle {
   marker: L.Marker;
   route: string;
@@ -141,6 +132,7 @@ interface TrackedVehicle {
   targetLon: number;
   targetCourse: number;
   targetSpeed: number; // km/h
+  targetHasServerProgress: boolean;
   // Timing
   updateTime: number; // performance.now()
   // Current rendered values
@@ -150,19 +142,37 @@ interface TrackedVehicle {
   currentProgress: number | null;
 }
 
+function easeOutQuad(t: number): number {
+  return t * (2 - t);
+}
+
+function absAngleDiffDeg(a: number, b: number): number {
+  const diff = Math.abs(a - b) % 360;
+  return diff > 180 ? 360 - diff : diff;
+}
+
+function inferTravelDir(
+  geom: RouteGeometry,
+  prevProgress: number,
+  targetProgress: number,
+  targetCourse: number,
+): number {
+  if (Math.abs(targetProgress - prevProgress) > 0.0001) {
+    return targetProgress >= prevProgress ? 1 : -1;
+  }
+  const routeBearing = bearingAtProgress(geom, targetProgress);
+  return absAngleDiffDeg(targetCourse, routeBearing) > 90 ? -1 : 1;
+}
+
 export class VehicleLayer {
   private tracked: Map<string, TrackedVehicle> = new Map();
-  private trailPoints: Map<string, [number, number][]> = new Map();
-  private trailLines: Map<string, L.Polyline[]> = new Map();
   private layerGroup: L.LayerGroup;
-  private trailGroup: L.LayerGroup;
   private rafId: number = 0;
 
   // Route geometry index for progress → position lookup
   private routeGeometries: Map<number, RouteGeometry> = new Map();
 
   constructor(map: L.Map) {
-    this.trailGroup = L.layerGroup().addTo(map);
     this.layerGroup = L.layerGroup().addTo(map);
     this.startAnimation();
   }
@@ -186,41 +196,96 @@ export class VehicleLayer {
     this.rafId = requestAnimationFrame(animate);
   }
 
-  /** Called on each server update (~10 s). Stores targets, creates/removes markers, updates trails. */
+  /** Called on each server update (~10 s). Stores targets and creates/removes markers. */
   update(vehicles: VehicleData[]): void {
     const now = performance.now();
     const seen = new Set<string>();
 
     for (const v of vehicles) {
       seen.add(v.id);
-      this.updateTrail(v);
 
       const tv = this.tracked.get(v.id);
       if (tv) {
+        const geom = v.route_id != null ? this.routeGeometries.get(v.route_id) : undefined;
+        const routeChanged = tv.routeId !== v.route_id;
+
         // Snap "previous" to wherever the marker currently is
         tv.prevLat = tv.currentLat;
         tv.prevLon = tv.currentLon;
         tv.prevCourse = tv.currentCourse;
         tv.prevProgress = tv.currentProgress;
 
+        if (routeChanged) {
+          if (geom && v.progress != null) {
+            const p = pointAtProgress(geom, v.progress);
+            const c = bearingAtProgress(geom, v.progress);
+            tv.prevLat = p[0];
+            tv.prevLon = p[1];
+            tv.prevCourse = c;
+            tv.prevProgress = v.progress;
+            tv.currentLat = p[0];
+            tv.currentLon = p[1];
+            tv.currentCourse = c;
+            tv.currentProgress = v.progress;
+            tv.marker.setLatLng([p[0], p[1]]);
+            this.updateHeading(tv.marker, c);
+          } else {
+            tv.prevLat = v.lat;
+            tv.prevLon = v.lon;
+            tv.prevCourse = v.course;
+            tv.prevProgress = v.progress;
+            tv.currentLat = v.lat;
+            tv.currentLon = v.lon;
+            tv.currentCourse = v.course;
+            tv.currentProgress = v.progress;
+            tv.marker.setLatLng([v.lat, v.lon]);
+            this.updateHeading(tv.marker, v.course);
+          }
+        }
+
         // Detect unreasonable progress jumps — snap instead of animating
         if (
+          !routeChanged &&
           tv.prevProgress != null && v.progress != null &&
           Math.abs(v.progress - tv.prevProgress) > MAX_ANIM_PROGRESS_DELTA
         ) {
-          // Large jump: teleport to new position immediately
+          // Large jump: teleport to new position immediately.
+          let snapLat = v.lat;
+          let snapLon = v.lon;
+          let snapCourse = v.course;
+          if (geom) {
+            const p = pointAtProgress(geom, v.progress);
+            snapLat = p[0];
+            snapLon = p[1];
+            snapCourse = bearingAtProgress(geom, v.progress);
+          }
           tv.prevProgress = v.progress;
-          tv.prevLat = v.lat;
-          tv.prevLon = v.lon;
-          tv.prevCourse = v.course;
+          tv.prevLat = snapLat;
+          tv.prevLon = snapLon;
+          tv.prevCourse = snapCourse;
+          tv.currentProgress = v.progress;
+          tv.currentLat = snapLat;
+          tv.currentLon = snapLon;
+          tv.currentCourse = snapCourse;
+          tv.marker.setLatLng([snapLat, snapLon]);
+          this.updateHeading(tv.marker, snapCourse);
         }
 
-        // Set new target
+        // If route geometry exists but server rejected snap (progress=null),
+        // keep the current routed position instead of drifting off-route.
+        const hasGeom = !!geom;
+        const targetProgress = hasGeom && v.progress == null && tv.currentProgress != null
+          ? tv.currentProgress
+          : v.progress;
+        const targetHasServerProgress = v.progress != null;
+
+        // Set new target (rendering happens in RAF interpolation loop).
         tv.targetLat = v.lat;
         tv.targetLon = v.lon;
         tv.targetCourse = v.course;
         tv.targetSpeed = v.speed;
-        tv.targetProgress = v.progress;
+        tv.targetProgress = targetProgress;
+        tv.targetHasServerProgress = targetHasServerProgress;
         tv.routeId = v.route_id;
         tv.updateTime = now;
 
@@ -231,13 +296,24 @@ export class VehicleLayer {
         }
         tv.marker.setPopupContent(this.popupHtml(v));
       } else {
-        const marker = L.marker([v.lat, v.lon], {
+        let initialLat = v.lat;
+        let initialLon = v.lon;
+        let initialCourse = v.course;
+        const geom = v.route_id != null ? this.routeGeometries.get(v.route_id) : undefined;
+        if (geom && v.progress != null) {
+          const p = pointAtProgress(geom, v.progress);
+          initialLat = p[0];
+          initialLon = p[1];
+          initialCourse = bearingAtProgress(geom, v.progress);
+        }
+
+        const marker = L.marker([initialLat, initialLon], {
           icon: createIcon(v.route, v.signal_lost),
           zIndexOffset: 100,
         });
         marker.bindPopup(this.popupHtml(v));
         marker.addTo(this.layerGroup);
-        this.updateHeading(marker, v.course);
+        this.updateHeading(marker, initialCourse);
 
         this.tracked.set(v.id, {
           marker,
@@ -246,33 +322,28 @@ export class VehicleLayer {
           signalLost: v.signal_lost,
           prevProgress: v.progress,
           targetProgress: v.progress,
-          prevLat: v.lat,
-          prevLon: v.lon,
-          prevCourse: v.course,
+          prevLat: initialLat,
+          prevLon: initialLon,
+          prevCourse: initialCourse,
           targetLat: v.lat,
           targetLon: v.lon,
           targetCourse: v.course,
           targetSpeed: v.speed,
+          targetHasServerProgress: v.progress != null,
           updateTime: now,
-          currentLat: v.lat,
-          currentLon: v.lon,
-          currentCourse: v.course,
+          currentLat: initialLat,
+          currentLon: initialLon,
+          currentCourse: initialCourse,
           currentProgress: v.progress,
         });
       }
     }
 
-    // Remove stale markers and trails
+    // Remove stale markers
     for (const [id, tv] of this.tracked) {
       if (!seen.has(id)) {
         this.layerGroup.removeLayer(tv.marker);
         this.tracked.delete(id);
-        const segments = this.trailLines.get(id);
-        if (segments) {
-          for (const seg of segments) this.trailGroup.removeLayer(seg);
-          this.trailLines.delete(id);
-        }
-        this.trailPoints.delete(id);
       }
     }
   }
@@ -280,72 +351,64 @@ export class VehicleLayer {
   /**
    * Runs every animation frame (~60 fps).
    *
-   * If the vehicle has progress + route geometry, it follows the route polyline.
-   * Otherwise falls back to linear lat/lon interpolation + dead-reckoning.
+   * If the vehicle has progress + route geometry, it follows the route polyline
+   * and extrapolates in a tightly capped window until the next backend update.
+   * Otherwise falls back to linear lat/lon interpolation.
    */
   private interpolateAll(): void {
     const now = performance.now();
 
     for (const [, tv] of this.tracked) {
-      const elapsed = now - tv.updateTime;
-      let lat: number, lon: number, course: number;
+      const elapsed = Math.max(0, now - tv.updateTime);
+      const t = Math.min(1, elapsed / INTERP_DURATION);
+      const easedT = easeOutQuad(t);
 
-      // Try route-following mode
+      let lat: number;
+      let lon: number;
+      let course: number;
+
       const geom = tv.routeId != null ? this.routeGeometries.get(tv.routeId) : undefined;
-      const hasRoute = geom && tv.targetProgress != null && tv.prevProgress != null;
+      const useRoutedAnimation = geom && tv.prevProgress != null && tv.targetProgress != null;
 
-      if (hasRoute) {
-        // --- Route-following animation ---
-        let progress: number;
-        if (elapsed < INTERP_DURATION) {
-          const t = elapsed / INTERP_DURATION;
-          progress = tv.prevProgress! + (tv.targetProgress! - tv.prevProgress!) * t;
-        } else {
-          // Dead reckoning: advance progress based on speed
+      if (useRoutedAnimation) {
+        const travelDir = inferTravelDir(
+          geom!,
+          tv.prevProgress!,
+          tv.targetProgress!,
+          tv.targetCourse,
+        );
+        let progress =
+          tv.prevProgress! + (tv.targetProgress! - tv.prevProgress!) * easedT;
+
+        const canExtrapolate =
+          tv.targetHasServerProgress &&
+          !tv.signalLost &&
+          tv.targetSpeed >= MIN_MOVING_SPEED_KMH &&
+          elapsed > INTERP_DURATION;
+        if (canExtrapolate) {
           const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
-          const extraS = extraMs / 1000;
-          const speedMs = tv.targetSpeed / 3.6;
-          const dMeters = speedMs * extraS;
-          const dProgress = geom!.totalDist > 0 ? dMeters / geom!.totalDist : 0;
-          // Direction: if targetProgress >= prevProgress, moving forward
-          const dir = tv.targetProgress! >= tv.prevProgress! ? 1 : -1;
-          progress = tv.targetProgress! + dProgress * dir;
+          const bySpeedMeters = (tv.targetSpeed / 3.6) * (extraMs / 1000);
+          const extrapMeters = Math.min(bySpeedMeters, MAX_ROUTE_EXTRAP_METERS);
+          const dProgress = geom!.totalDist > 0 ? extrapMeters / geom!.totalDist : 0;
+          progress = tv.targetProgress! + dProgress * travelDir;
         }
-        progress = Math.max(0, Math.min(1, progress));
 
+        progress = Math.max(0, Math.min(1, progress));
         const pos = pointAtProgress(geom!, progress);
         lat = pos[0];
         lon = pos[1];
         course = bearingAtProgress(geom!, progress);
-        // Reverse direction: flip bearing 180°
-        if (tv.targetProgress! < tv.prevProgress!) {
+        if (travelDir < 0) {
           course = (course + 180) % 360;
         }
         tv.currentProgress = progress;
       } else {
-        // --- Fallback: linear lat/lon interpolation ---
-        if (elapsed < INTERP_DURATION) {
-          const t = elapsed / INTERP_DURATION;
-          lat = tv.prevLat + (tv.targetLat - tv.prevLat) * t;
-          lon = tv.prevLon + (tv.targetLon - tv.prevLon) * t;
-          const ht = Math.min(elapsed / 3000, 1);
-          course = lerpAngle(tv.prevCourse, tv.targetCourse, ht);
-        } else {
-          const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
-          const extraS = extraMs / 1000;
-          const speedMs = tv.targetSpeed / 3.6;
-          const bearing = tv.targetCourse * DEG2RAD;
-          const dMeters = speedMs * extraS;
-          const cosLat = Math.cos(tv.targetLat * DEG2RAD);
-
-          lat = tv.targetLat + (dMeters * Math.cos(bearing)) / M_PER_DEG_LAT;
-          lon = tv.targetLon + (dMeters * Math.sin(bearing)) / (M_PER_DEG_LAT * cosLat);
-          course = tv.targetCourse;
-        }
+        lat = tv.prevLat + (tv.targetLat - tv.prevLat) * easedT;
+        lon = tv.prevLon + (tv.targetLon - tv.prevLon) * easedT;
+        course = lerpAngle(tv.prevCourse, tv.targetCourse, easedT);
         tv.currentProgress = tv.targetProgress;
       }
 
-      // Only touch the DOM when the value actually changed
       if (
         Math.abs(lat - tv.currentLat) > 0.0000005 ||
         Math.abs(lon - tv.currentLon) > 0.0000005
@@ -360,71 +423,6 @@ export class VehicleLayer {
         tv.currentCourse = course;
       }
     }
-  }
-
-  /** Update trail: keep points within TRAIL_MAX_DIST_M, render as fading gradient. */
-  private updateTrail(v: VehicleData): void {
-    const pts = this.trailPoints.get(v.id) || [];
-    const newPt: [number, number] = [v.lat, v.lon];
-    const last = pts[pts.length - 1];
-
-    if (!last || distM(last, newPt) > 2) {
-      pts.push(newPt);
-    }
-
-    // Trim from the back to stay within max trail distance
-    let totalDist = 0;
-    let keepFrom = pts.length - 1;
-    for (let i = pts.length - 1; i > 0; i--) {
-      totalDist += distM(pts[i - 1], pts[i]);
-      if (totalDist > TRAIL_MAX_DIST_M) {
-        keepFrom = i;
-        break;
-      }
-      keepFrom = i - 1;
-    }
-    const trimmed = pts.slice(keepFrom);
-    this.trailPoints.set(v.id, trimmed);
-
-    // Remove old trail segments
-    const oldSegs = this.trailLines.get(v.id);
-    if (oldSegs) {
-      for (const seg of oldSegs) this.trailGroup.removeLayer(seg);
-    }
-
-    if (trimmed.length < 2) {
-      this.trailLines.delete(v.id);
-      return;
-    }
-
-    // Build gradient trail: split into segments with decreasing opacity
-    const color = routeColor(v.route);
-    const segments: L.Polyline[] = [];
-    const segCount = Math.min(TRAIL_SEGMENT_COUNT, trimmed.length - 1);
-    const ptsPerSeg = Math.max(1, Math.floor((trimmed.length - 1) / segCount));
-
-    for (let s = 0; s < segCount; s++) {
-      const startIdx = s * ptsPerSeg;
-      const endIdx = s === segCount - 1 ? trimmed.length - 1 : (s + 1) * ptsPerSeg;
-      if (startIdx >= trimmed.length - 1) break;
-
-      const segPts = trimmed.slice(startIdx, endIdx + 1);
-      // Oldest segment (s=0) is most faded; newest (s=segCount-1) is brightest
-      const opacity = 0.15 + 0.55 * ((s + 1) / segCount);
-      const weight = 3 + 2 * ((s + 1) / segCount);
-
-      const polyline = L.polyline(segPts, {
-        color,
-        weight,
-        opacity,
-        lineCap: "round",
-        lineJoin: "round",
-      });
-      polyline.addTo(this.trailGroup);
-      segments.push(polyline);
-    }
-
-    this.trailLines.set(v.id, segments);
   }
 
   private updateHeading(marker: L.Marker, course: number): void {
@@ -468,9 +466,6 @@ export class VehicleLayer {
   clear(): void {
     cancelAnimationFrame(this.rafId);
     this.layerGroup.clearLayers();
-    this.trailGroup.clearLayers();
     this.tracked.clear();
-    this.trailPoints.clear();
-    this.trailLines.clear();
   }
 }

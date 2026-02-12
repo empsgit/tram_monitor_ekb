@@ -79,3 +79,11 @@ async def get_raw_ettu_routes():
             return {"routes": result}
     except Exception as e:
         return {"error": str(e)}
+
+
+@router.get("/projection")
+async def get_projection_diagnostics(limit: int = 100):
+    """Get recent projection anomalies (out-of-section/backward/far-snap)."""
+    if tracker is None:
+        return {"error": "Tracker not initialized"}
+    return tracker.get_projection_diagnostics(limit=limit)
