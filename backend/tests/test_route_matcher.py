@@ -52,3 +52,17 @@ def test_line_length():
     length = RouteMatcher._line_length_meters(coords)
     # ~0.01 degrees of longitude at ~56.8 lat ≈ 610m
     assert 500 < length < 750
+
+
+def test_match_with_none_course_does_not_crash():
+    """Route matching should still work if heading is temporarily unknown."""
+    matcher = RouteMatcher()
+    coords = [
+        [56.8389, 60.5900],
+        [56.8389, 60.6000],
+    ]
+    matcher.load_route(1, coords)
+
+    result = matcher.match(1, 56.8389, 60.5950, None)
+    assert result is not None
+    assert 0.0 <= result.progress <= 1.0

@@ -73,16 +73,48 @@ async function main() {
 
   // WebSocket connection
   const wsClient = new WsClient();
+  // Do not render potentially stale Redis snapshot on (re)connect.
+  // We show vehicles only after receiving a live `update` frame.
+  let hasFreshVehicleUpdate = false;
+
+  const SNAPSHOT_MAX_AGE_MS = 20_000;
+
+  const isFreshSnapshot = (ts: string | null): boolean => {
+    if (!ts) return false;
+    const parsed = Date.parse(ts);
+    if (Number.isNaN(parsed)) return false;
+    return Date.now() - parsed <= SNAPSHOT_MAX_AGE_MS;
+  };
 
   wsClient.onStatusChange = (connected) => {
     store.setConnected(connected);
     statusDot.classList.toggle("connected", connected);
     statusText.textContent = connected ? "Онлайн" : "Подключение...";
+
+    if (!connected) {
+      hasFreshVehicleUpdate = false;
+      store.updateVehicles([]);
+    }
   };
 
   wsClient.subscribe((msg) => {
-    // Only update store; the store subscriber handles all rendering
-    store.updateVehicles(msg.vehicles);
+    if (msg.type === "update") {
+      hasFreshVehicleUpdate = true;
+      store.updateVehicles(msg.vehicles);
+      return;
+    }
+
+    // Accept startup snapshot only if it is fresh by API vehicle timestamps.
+    if (hasFreshVehicleUpdate) {
+      store.updateVehicles(msg.vehicles);
+      return;
+    }
+
+    const hasVehicles = msg.vehicles.length > 0;
+    const snapshotIsFresh = hasVehicles && msg.vehicles.every((v) => isFreshSnapshot(v.timestamp));
+    if (snapshotIsFresh) {
+      store.updateVehicles(msg.vehicles);
+    }
   });
 
   wsClient.connect();
