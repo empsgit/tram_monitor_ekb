@@ -389,7 +389,10 @@ class VehicleTracker:
         # (e.g. vehicle has moved <30m), fall back to API course to avoid crashes.
         match_course = movement_bearing if movement_bearing is not None else rv.course
         match = self.route_matcher.match(route_id, rv.lat, rv.lon, match_course)
-        if match:
+        # Apply route snapping only when geometry is close to observed GPS.
+        # If geometry is too far, keep raw API position to avoid wrong map placement.
+        MAX_APPLY_SNAP_DISTANCE_M = 60.0
+        if match and match.distance_m <= MAX_APPLY_SNAP_DISTANCE_M:
             raw_progress = match.progress
 
             # Keep progress stable, but favor freshness to avoid delayed display.
@@ -426,8 +429,8 @@ class VehicleTracker:
             if snapped:
                 state.lat, state.lon = snapped
         else:
-            smoothed = prev.get("progress") if prev and prev["route_id"] == route_id else None
-            state.progress = smoothed
+            smoothed = None
+            state.progress = None
 
         self._smooth[rv.dev_id] = {
             "progress": smoothed,
