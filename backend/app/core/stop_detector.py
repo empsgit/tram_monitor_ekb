@@ -98,11 +98,13 @@ class StopDetector:
     def detect(
         self, route_id: int, lat: float, lon: float,
         course: float | None = None, max_next: int = 5,
+        preferred_direction: int | None = None,
     ) -> DetectionResult:
         """Find vehicle's position on route using GPS proximity and stop sequence.
 
         Tries all directions, picks the best match. Uses course as a tiebreaker
         when segments in different directions are similarly close.
+        preferred_direction adds a penalty for switching to maintain consistency.
         """
         if route_id not in self._stops:
             return DetectionResult(prev_stop=None, next_stops=[], direction=0)
@@ -128,7 +130,11 @@ class StopDetector:
                 if diff > 180:
                     diff = 360 - diff
                 if diff > 90:
-                    score += 250_000  # ~500 m equivalent penalty
+                    score += 500_000  # ~707m equivalent penalty (strong)
+
+            # Preferred direction: penalize switching to maintain consistency
+            if preferred_direction is not None and d != preferred_direction:
+                score += 200_000  # ~447m equivalent penalty
 
             if score < best_score:
                 best_score = score

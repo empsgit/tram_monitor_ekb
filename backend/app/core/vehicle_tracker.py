@@ -97,6 +97,10 @@ class VehicleTracker:
         # Batch of travel time observations to persist
         self._travel_time_batch: list[dict] = []
 
+        # Full next-stops list per vehicle (for station arrival queries)
+        # vehicle_id -> [StopOnRoute] (all remaining stops, not just first 5)
+        self._vehicle_all_next_stops: dict[str, list[StopOnRoute]] = {}
+
         # Ghost vehicle tracking: vehicle_id -> last seen UTC timestamp
         self._last_seen: dict[str, datetime.datetime] = {}
 
@@ -280,6 +284,7 @@ class VehicleTracker:
                     self.current_states.pop(vid, None)
                     self._smooth.pop(vid, None)
                     self._recent_positions.pop(vid, None)
+                    self._vehicle_all_next_stops.pop(vid, None)
 
             for vid in expired:
                 del self._last_seen[vid]
@@ -319,25 +324,26 @@ class VehicleTracker:
         if route_id is None:
             return state
 
-        # Track recent positions for bearing calculation
+        # Track recent positions for bearing calculation (keep last 5 for better averaging)
         positions = self._recent_positions.get(rv.dev_id, [])
         positions.append((rv.lat, rv.lon))
-        if len(positions) > 3:
-            positions = positions[-3:]
+        if len(positions) > 5:
+            positions = positions[-5:]
         self._recent_positions[rv.dev_id] = positions
 
-        # Compute bearing from recent movement (last 3 points)
+        # Compute bearing from recent movement
+        # Only use movement bearing if the vehicle has actually moved significantly
+        movement_bearing = None
         if len(positions) >= 2:
             p_old, p_new = positions[0], positions[-1]
-            dlat = p_new[0] - p_old[0]
-            dlon = p_new[1] - p_old[1]
-            dist_sq = dlat * dlat + dlon * dlon
-            if dist_sq > 1e-10:  # moved at least ~1m
-                movement_bearing = math.degrees(math.atan2(dlon * LON_M_PER_DEG, dlat * LAT_M_PER_DEG)) % 360
-            else:
+            dlat_m = (p_new[0] - p_old[0]) * LAT_M_PER_DEG
+            dlon_m = (p_new[1] - p_old[1]) * LON_M_PER_DEG
+            dist_m = math.sqrt(dlat_m * dlat_m + dlon_m * dlon_m)
+            if dist_m > 30:  # Moved at least 30m — reliable bearing
+                movement_bearing = math.degrees(math.atan2(dlon_m, dlat_m)) % 360
+            elif rv.speed > 5:  # API reports moving but GPS jitter hides it
                 movement_bearing = rv.course
-        else:
-            movement_bearing = rv.course
+        # If movement_bearing is None, detection relies on preferred_direction
 
         # --- Speed smoothing (simple EMA, independent of route matching) ---
         prev = self._smooth.get(rv.dev_id)
@@ -347,10 +353,19 @@ class VehicleTracker:
             smoothed_speed = rv.speed
 
         # --- Stop detection (GPS-based, uses ETTU stop order) ---
+        # Use previous direction as hint for sticky detection
+        prev_direction = None
+        if prev and prev["route_id"] == route_id:
+            prev_direction = prev.get("direction")
+
         detection = self.stop_detector.detect(
-            route_id, rv.lat, rv.lon, movement_bearing, max_next=5
+            route_id, rv.lat, rv.lon, movement_bearing,
+            max_next=50, preferred_direction=prev_direction,
         )
         direction = detection.direction
+
+        # Store full next stops for station arrival queries
+        self._vehicle_all_next_stops[rv.dev_id] = detection.next_stops
 
         if detection.prev_stop:
             state.prev_stop = StopInfo(
@@ -358,9 +373,11 @@ class VehicleTracker:
                 name=detection.prev_stop.name,
             )
 
+        # Show up to 5 next stops in vehicle state (for frontend display)
         if detection.next_stops:
+            display_stops = detection.next_stops[:5]
             etas = self.eta_calculator.calculate(
-                rv.lat, rv.lon, smoothed_speed, detection.next_stops
+                rv.lat, rv.lon, smoothed_speed, display_stops
             )
             state.next_stops = [
                 NextStopInfo(id=stop.stop_id, name=stop.name, eta_seconds=eta_s)
@@ -835,50 +852,52 @@ out geom;
     def get_vehicles_for_stop(
         self, stop_id: int, route_filter: int | None = None
     ) -> list[dict]:
-        """Get upcoming vehicles for a specific stop."""
-        # Try pipeline-based approach first (vehicles with this stop in next_stops)
+        """Get upcoming vehicles for a specific stop.
+
+        Only includes vehicles that have this stop genuinely ahead of them
+        on their current route and direction. No distance-based fallback —
+        a vehicle must have the stop in its detected next_stops to appear.
+        """
         arrivals = []
-        seen_vehicles: set[str] = set()
+        serving_routes = self._stop_to_routes.get(stop_id, set())
+
         for vid, state in self.current_states.items():
+            if not state.route_id or state.route_id not in serving_routes:
+                continue
             if route_filter and state.route_id != route_filter:
                 continue
-            for ns in state.next_stops:
-                if ns.id == stop_id:
-                    arrivals.append({
-                        "vehicle_id": state.id,
-                        "board_num": state.board_num,
-                        "route": state.route,
-                        "route_id": state.route_id,
-                        "eta_seconds": ns.eta_seconds,
-                    })
-                    seen_vehicles.add(vid)
+            if state.signal_lost:
+                continue  # Don't show ghost vehicles in station arrivals
+
+            # Check full next-stops list (all remaining stops on this direction)
+            all_next = self._vehicle_all_next_stops.get(vid, [])
+            stops_to_target = []
+            found = False
+            for ns in all_next:
+                stops_to_target.append(ns)
+                if ns.stop_id == stop_id:
+                    found = True
                     break
 
-        # Fallback: find vehicles on routes serving this stop, estimate by distance
-        serving_routes = self._stop_to_routes.get(stop_id, set())
-        stop_loc = self._stop_coords.get(stop_id)
-        if serving_routes and stop_loc:
-            for vid, state in self.current_states.items():
-                if vid in seen_vehicles:
-                    continue
-                if state.route_id not in serving_routes:
-                    continue
-                if route_filter and state.route_id != route_filter:
-                    continue
+            if not found:
+                continue
 
-                dist_m = _haversine(state.lat, state.lon, stop_loc[0], stop_loc[1])
-                speed = max(state.speed, 5.0)
-                eta_s = int(dist_m / (speed / 3.6))
-                if eta_s > 3600:
-                    continue
+            # Calculate ETA to this specific stop along the route
+            eta = None
+            if stops_to_target:
+                calc = self.eta_calculator.calculate(
+                    state.lat, state.lon, state.speed, stops_to_target
+                )
+                if calc:
+                    _, eta = calc[-1]  # ETA to the target stop (last in list)
 
-                arrivals.append({
-                    "vehicle_id": state.id,
-                    "board_num": state.board_num,
-                    "route": state.route,
-                    "route_id": state.route_id,
-                    "eta_seconds": eta_s,
-                })
+            arrivals.append({
+                "vehicle_id": state.id,
+                "board_num": state.board_num,
+                "route": state.route,
+                "route_id": state.route_id,
+                "eta_seconds": eta,
+            })
 
         arrivals.sort(key=lambda a: a.get("eta_seconds") or 9999)
         return arrivals[:15]
