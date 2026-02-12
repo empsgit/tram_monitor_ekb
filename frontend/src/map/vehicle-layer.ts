@@ -447,11 +447,12 @@ export class VehicleLayer {
 
   private updateHeading(marker: L.Marker, course: number): void {
     const el = (marker as any)._icon as HTMLElement | undefined;
+    const fixedCourse = (course + 90 + 360) % 360; 
     if (!el) return;
     const inner = el.querySelector(".tram-marker") as HTMLElement | null;
-    if (inner) inner.style.transform = `rotate(${course}deg)`;
+    if (inner) inner.style.transform = `rotate(${fixedCourse}deg)`;
     const label = el.querySelector(".tram-label") as HTMLElement | null;
-    if (label) label.style.transform = `rotate(-${course}deg)`;
+    if (label) label.style.transform = `rotate(-${fixedCourse}deg)`;
   }
 
   private popupHtml(v: VehicleData): string {
