@@ -86,7 +86,7 @@ class VehicleTracker:
 
         # Per-vehicle smoothing state for progress and speed
         self._smooth: dict[str, dict] = {}
-        # {vehicle_id: {"progress": float, "speed": float, "direction": int, "route_id": int}}
+        # {vehicle_id: {"progress": float | None, "speed": float, "direction": int, "route_id": int}}
 
         # Recent GPS positions for bearing calculation (last 3 points)
         self._recent_positions: dict[str, list[tuple[float, float]]] = {}
@@ -385,34 +385,51 @@ class VehicleTracker:
             ]
 
         # --- Route matching (for map display only: snapping + animation) ---
-        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing)
+        # Route matcher expects a numeric course. If movement bearing is unavailable
+        # (e.g. vehicle has moved <30m), fall back to API course to avoid crashes.
+        match_course = movement_bearing if movement_bearing is not None else rv.course
+        match = self.route_matcher.match(route_id, rv.lat, rv.lon, match_course)
         if match:
             raw_progress = match.progress
 
+            # Keep animation smooth, but never let smoothing pull a tram too far from GPS.
             MAX_DELTA = 0.05
-            if prev and prev["route_id"] == route_id and prev["direction"] == direction:
+            MAX_SNAP_ERROR_M = 120.0
+            prev_progress = None
+            if prev and prev["route_id"] == route_id:
+                prev_progress = prev.get("progress")
+
+            if prev_progress is not None and prev and prev["direction"] == direction:
                 alpha = 0.4
-                smoothed = prev["progress"] * (1 - alpha) + raw_progress * alpha
+                smoothed = prev_progress * (1 - alpha) + raw_progress * alpha
                 if direction == 0:
-                    smoothed = max(smoothed, prev["progress"])
+                    smoothed = max(smoothed, prev_progress)
                 else:
-                    smoothed = min(smoothed, prev["progress"])
-                delta = smoothed - prev["progress"]
+                    smoothed = min(smoothed, prev_progress)
+                delta = smoothed - prev_progress
                 if abs(delta) > MAX_DELTA:
-                    smoothed = prev["progress"] + MAX_DELTA * (1 if delta > 0 else -1)
+                    smoothed = prev_progress + MAX_DELTA * (1 if delta > 0 else -1)
             else:
                 smoothed = raw_progress
 
-            state.progress = smoothed
             snapped = self.route_matcher.interpolate_progress(route_id, smoothed)
+            if snapped:
+                snap_error_m = _haversine(rv.lat, rv.lon, snapped[0], snapped[1])
+                if snap_error_m > MAX_SNAP_ERROR_M:
+                    # Smoothing produced a point too far from observed GPS.
+                    # Fall back to the nearest on-route projection from current GPS.
+                    smoothed = raw_progress
+                    snapped = self.route_matcher.interpolate_progress(route_id, smoothed)
+
+            state.progress = smoothed
             if snapped:
                 state.lat, state.lon = snapped
         else:
-            smoothed = prev["progress"] if prev and prev["route_id"] == route_id else None
+            smoothed = prev.get("progress") if prev and prev["route_id"] == route_id else None
             state.progress = smoothed
 
         self._smooth[rv.dev_id] = {
-            "progress": smoothed if smoothed is not None else 0,
+            "progress": smoothed,
             "speed": smoothed_speed,
             "direction": direction,
             "route_id": route_id,
