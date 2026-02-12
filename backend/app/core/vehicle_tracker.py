@@ -385,7 +385,10 @@ class VehicleTracker:
             ]
 
         # --- Route matching (for map display only: snapping + animation) ---
-        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing)
+        # Route matcher expects a numeric course. If movement bearing is unavailable
+        # (e.g. vehicle has moved <30m), fall back to API course to avoid crashes.
+        match_course = movement_bearing if movement_bearing is not None else rv.course
+        match = self.route_matcher.match(route_id, rv.lat, rv.lon, match_course)
         if match:
             raw_progress = match.progress
 
