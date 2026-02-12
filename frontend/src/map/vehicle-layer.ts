@@ -312,11 +312,12 @@ export class VehicleLayer {
           if (Math.abs(delta) > 0.0002) {
             tv.travelDir = delta >= 0 ? 1 : -1;
           }
+          const dir = tv.travelDir;
           // Do not move backward while actively moving: this removes route "rollback" jitter.
-          if (v.speed >= MIN_MOVING_SPEED_KMH) {
-            if (tv.travelDir > 0 && nextTargetProgress < tv.currentProgress) {
+          if (v.speed >= MIN_MOVING_SPEED_KMH && dir != null) {
+            if (dir > 0 && nextTargetProgress < tv.currentProgress) {
               nextTargetProgress = tv.currentProgress;
-            } else if (tv.travelDir < 0 && nextTargetProgress > tv.currentProgress) {
+            } else if (dir < 0 && nextTargetProgress > tv.currentProgress) {
               nextTargetProgress = tv.currentProgress;
             }
           }
