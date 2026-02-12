@@ -205,21 +205,13 @@ class VehicleTracker:
                 self._route_geometries[route.id] = route.points
                 self.route_matcher.load_route(route.id, route.points)
 
-            # Load stops for this route (only named stops for the detector)
+            # Load stops for this route (only named stops for the detector).
+            # No geometry projection needed — the detector uses GPS distances
+            # and ETTU stop ordering directly.
             route_stops = []
             for s in route.stops:
                 if not s["name"]:
                     continue  # Skip unnamed stops – they show as blank in popups
-                if route.points:
-                    match = self.route_matcher.match(route.id, s["lat"], s["lon"])
-                    if match:
-                        total_len = self.route_matcher.get_total_length(route.id)
-                        dist = match.progress * total_len
-                    else:
-                        dist = 0.0
-                else:
-                    dist = 0.0
-
                 route_stops.append(StopOnRoute(
                     stop_id=s["id"],
                     name=_stop_display_name(s["name"], s.get("direction_label", "")),
@@ -227,7 +219,6 @@ class VehicleTracker:
                     lon=s["lon"],
                     order=s["order"],
                     direction=s["direction"],
-                    distance_along=dist,
                 ))
 
             self.stop_detector.load_route_stops(route.id, route_stops)
@@ -306,7 +297,11 @@ class VehicleTracker:
             logger.exception("Error in vehicle poll cycle")
 
     def _process_vehicle(self, rv: RawVehicle) -> VehicleState | None:
-        """Process a single raw vehicle through the pipeline."""
+        """Process a single raw vehicle through the pipeline.
+
+        Stop detection is GPS-based (independent of route geometry).
+        Route geometry is only used for visual snapping + animation progress.
+        """
         route_id = self._route_num_to_id.get(rv.route_num)
 
         state = VehicleState(
@@ -331,7 +326,7 @@ class VehicleTracker:
             positions = positions[-3:]
         self._recent_positions[rv.dev_id] = positions
 
-        # Compute bearing from recent movement (last 3 points) instead of noisy GPS heading
+        # Compute bearing from recent movement (last 3 points)
         if len(positions) >= 2:
             p_old, p_new = positions[0], positions[-1]
             dlat = p_new[0] - p_old[0]
@@ -340,81 +335,22 @@ class VehicleTracker:
             if dist_sq > 1e-10:  # moved at least ~1m
                 movement_bearing = math.degrees(math.atan2(dlon * LON_M_PER_DEG, dlat * LAT_M_PER_DEG)) % 360
             else:
-                movement_bearing = rv.course  # stationary — fall back to GPS heading
+                movement_bearing = rv.course
         else:
             movement_bearing = rv.course
 
-        # Route matching — project raw GPS onto route line
-        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing)
-        if not match:
-            # Clear stale smoothing if vehicle can't be matched
-            self._smooth.pop(rv.dev_id, None)
-            # Fallback: find nearest stops by GPS distance (no ETA without route match)
-            detection = self.stop_detector.detect_by_position(
-                route_id, rv.lat, rv.lon, max_next=5
-            )
-            if detection.prev_stop:
-                state.prev_stop = StopInfo(
-                    id=detection.prev_stop.stop_id,
-                    name=detection.prev_stop.name,
-                )
-            if detection.next_stops:
-                state.next_stops = [
-                    NextStopInfo(id=s.stop_id, name=s.name, eta_seconds=None)
-                    for s in detection.next_stops
-                ]
-            return state
-
-        raw_progress = match.progress
-        direction = match.direction
-
-        # --- Smooth progress and speed ---
-        # Max progress change per cycle (~10s): 60 km/h on a 5km route = ~3.3%
-        MAX_DELTA = 0.05
+        # --- Speed smoothing (simple EMA, independent of route matching) ---
         prev = self._smooth.get(rv.dev_id)
-        if prev and prev["route_id"] == route_id and prev["direction"] == direction:
-            # Same route + direction: apply EMA with monotonic + clamped delta
-            alpha = 0.4
-            smoothed = prev["progress"] * (1 - alpha) + raw_progress * alpha
-
-            # Enforce monotonic movement (forward: increasing, reverse: decreasing)
-            if direction == 0:
-                smoothed = max(smoothed, prev["progress"])
-            else:
-                smoothed = min(smoothed, prev["progress"])
-
-            # Clamp max step to prevent full-route traversal from GPS glitches
-            delta = smoothed - prev["progress"]
-            if abs(delta) > MAX_DELTA:
-                smoothed = prev["progress"] + MAX_DELTA * (1 if delta > 0 else -1)
-
+        if prev and prev["route_id"] == route_id:
             smoothed_speed = prev["speed"] * 0.6 + rv.speed * 0.4
         else:
-            # New route, new direction, or first time — accept raw values
-            smoothed = raw_progress
             smoothed_speed = rv.speed
 
-        self._smooth[rv.dev_id] = {
-            "progress": smoothed,
-            "speed": smoothed_speed,
-            "direction": direction,
-            "route_id": route_id,
-        }
-
-        state.progress = smoothed
-
-        # Snap displayed lat/lon to the route line
-        snapped = self.route_matcher.interpolate_progress(route_id, smoothed)
-        if snapped:
-            state.lat, state.lon = snapped
-
-        total_len = self.route_matcher.get_total_length(route_id)
-        distance_along = smoothed * total_len
-
-        # Stop detection (up to 5 next stops for richer data)
+        # --- Stop detection (GPS-based, uses ETTU stop order) ---
         detection = self.stop_detector.detect(
-            route_id, distance_along, direction, max_next=5
+            route_id, rv.lat, rv.lon, movement_bearing, max_next=5
         )
+        direction = detection.direction
 
         if detection.prev_stop:
             state.prev_stop = StopInfo(
@@ -422,19 +358,48 @@ class VehicleTracker:
                 name=detection.prev_stop.name,
             )
 
-        # ETA calculation — use smoothed speed
         if detection.next_stops:
             etas = self.eta_calculator.calculate(
-                distance_along, smoothed_speed, detection.next_stops
+                rv.lat, rv.lon, smoothed_speed, detection.next_stops
             )
             state.next_stops = [
-                NextStopInfo(
-                    id=stop.stop_id,
-                    name=stop.name,
-                    eta_seconds=eta_s,
-                )
+                NextStopInfo(id=stop.stop_id, name=stop.name, eta_seconds=eta_s)
                 for stop, eta_s in etas
             ]
+
+        # --- Route matching (for map display only: snapping + animation) ---
+        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing)
+        if match:
+            raw_progress = match.progress
+
+            MAX_DELTA = 0.05
+            if prev and prev["route_id"] == route_id and prev["direction"] == direction:
+                alpha = 0.4
+                smoothed = prev["progress"] * (1 - alpha) + raw_progress * alpha
+                if direction == 0:
+                    smoothed = max(smoothed, prev["progress"])
+                else:
+                    smoothed = min(smoothed, prev["progress"])
+                delta = smoothed - prev["progress"]
+                if abs(delta) > MAX_DELTA:
+                    smoothed = prev["progress"] + MAX_DELTA * (1 if delta > 0 else -1)
+            else:
+                smoothed = raw_progress
+
+            state.progress = smoothed
+            snapped = self.route_matcher.interpolate_progress(route_id, smoothed)
+            if snapped:
+                state.lat, state.lon = snapped
+        else:
+            smoothed = prev["progress"] if prev and prev["route_id"] == route_id else None
+            state.progress = smoothed
+
+        self._smooth[rv.dev_id] = {
+            "progress": smoothed if smoothed is not None else 0,
+            "speed": smoothed_speed,
+            "direction": direction,
+            "route_id": route_id,
+        }
 
         return state
 
@@ -836,7 +801,7 @@ out geom;
                     "id": s.stop_id,
                     "name": s.name,
                     "order": s.order,
-                    "distance_along_m": round(s.distance_along, 1),
+                    "cumulative_distance_m": round(s.cumulative_distance_m, 1),
                 })
 
             route_diags.append({
