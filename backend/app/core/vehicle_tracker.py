@@ -273,6 +273,12 @@ class VehicleTracker:
             states = []
 
             for rv in raw_vehicles:
+                # If vehicle was a ghost (signal_lost), clear stale position history
+                # so bearing isn't computed from old coordinates
+                prev_state = self.current_states.get(rv.dev_id)
+                if prev_state and prev_state.signal_lost:
+                    self._recent_positions.pop(rv.dev_id, None)
+
                 state = self._process_vehicle(rv)
                 if state:
                     state.signal_lost = False
@@ -398,9 +404,12 @@ class VehicleTracker:
                 for stop, eta_s in etas
             ]
 
-        # --- Route matching (for progress tracking only, NOT for position) ---
-        # We keep progress for potential animation use but NEVER override
-        # the real GPS coordinates — the ETTU API positions are accurate.
+        # --- Route matching (progress tracking for diagnostics, NOT for frontend position) ---
+        # The frontend uses progress to position markers on route geometry via
+        # pointAtProgress(). Since OSM geometry is forward-only and projection can be
+        # wrong, we track progress internally but DON'T send it to the frontend.
+        # The frontend will use raw lat/lon from the API instead.
+        internal_progress = None
         match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing or rv.course)
         if match:
             raw_progress = match.progress
@@ -462,19 +471,13 @@ class VehicleTracker:
                     })
                     bounded_progress = prev_progress
 
-            state.progress = bounded_progress
-            # Do NOT snap lat/lon — use raw GPS from API
-        else:
-            state.progress = None
-            if match:
-                self._log_projection_event("snap_rejected_far", {
-                    "vehicle_id": rv.dev_id,
-                    "route_id": route_id,
-                    "distance_m": round(match.distance_m, 2),
-                })
+            internal_progress = bounded_progress
+
+        # Don't send progress to frontend — it uses raw lat/lon from API
+        state.progress = None
 
         self._smooth[rv.dev_id] = {
-            "progress": state.progress,
+            "progress": internal_progress,
             "speed": smoothed_speed,
             "direction": direction,
             "route_id": route_id,
@@ -825,8 +828,6 @@ out geom;
                         """),
                         {"id": s.id, "name": s.name, "direction": s.direction, "lat": s.lat, "lon": s.lon},
                     )
-                # Clean up any stops with name='None' from previous bug
-                await session.execute(text("DELETE FROM stops WHERE name = 'None'"))
                 await session.commit()
             await self._update_cache_timestamp("ettu_stops")
         except Exception:
