@@ -46,6 +46,7 @@ const INTERP_DURATION = 1200; // ms — quickly converge to latest server point
 const MAX_EXTRAP_MS = 12000; // ms — capped route extrapolation between updates
 const MAX_ROUTE_EXTRAP_METERS = 140; // hard cap to prevent visible drift
 const MIN_MOVING_SPEED_KMH = 3;
+const STATIONARY_SPEED_KMH = 0.1;
 const DEG2RAD = Math.PI / 180;
 const M_PER_DEG_LAT = 111320;
 
@@ -299,7 +300,8 @@ export class VehicleLayer {
         // Set new target (rendering happens in RAF interpolation loop).
         tv.targetLat = v.lat;
         tv.targetLon = v.lon;
-        tv.targetCourse = v.course;
+        // Keep previous heading while stopped to avoid random spins at 0 km/h.
+        tv.targetCourse = v.speed <= STATIONARY_SPEED_KMH ? tv.currentCourse : v.course;
         tv.targetSpeed = v.speed;
         tv.targetProgress = targetProgress;
         tv.targetHasServerProgress = targetHasServerProgress;
@@ -421,6 +423,9 @@ export class VehicleLayer {
         if (travelDir < 0) {
           course = (course + 180) % 360;
         }
+        if (tv.targetSpeed <= STATIONARY_SPEED_KMH) {
+          course = tv.currentCourse;
+        }
         tv.currentProgress = progress;
       } else {
         lat = tv.prevLat + (tv.targetLat - tv.prevLat) * easedT;
@@ -439,15 +444,25 @@ export class VehicleLayer {
             (tv.targetSpeed / 3.6) * (extraMs / 1000),
             MAX_ROUTE_EXTRAP_METERS,
           );
-          // Use normalized course for extrapolation to avoid sideways drift.
-          const motionCourse = (tv.targetCourse - 90 + 360) % 360;
-          const cRad = motionCourse * DEG2RAD;
-          const cosLat = Math.cos(tv.targetLat * DEG2RAD);
-          lat = tv.targetLat + (meters * Math.cos(cRad)) / M_PER_DEG_LAT;
-          lon = tv.targetLon + (meters * Math.sin(cRad)) / (M_PER_DEG_LAT * cosLat);
-          course = motionCourse;
+          // Extrapolate along observed motion vector (prev -> target), not raw API course.
+          const avgLat = (tv.prevLat + tv.targetLat) * 0.5;
+          const cosAvgLat = Math.cos(avgLat * DEG2RAD);
+          const dLatM = (tv.targetLat - tv.prevLat) * M_PER_DEG_LAT;
+          const dLonM = (tv.targetLon - tv.prevLon) * M_PER_DEG_LAT * cosAvgLat;
+          const distM = Math.hypot(dLatM, dLonM);
+          if (distM > 2) {
+            const uxLat = dLatM / distM;
+            const uxLon = dLonM / distM;
+            const cosLat = Math.cos(tv.targetLat * DEG2RAD);
+            lat = tv.targetLat + (meters * uxLat) / M_PER_DEG_LAT;
+            lon = tv.targetLon + (meters * uxLon) / (M_PER_DEG_LAT * cosLat);
+            course = (Math.atan2(uxLon, uxLat) * 180 / Math.PI + 360) % 360;
+          }
         }
 
+        if (tv.targetSpeed <= STATIONARY_SPEED_KMH) {
+          course = tv.currentCourse;
+        }
         tv.currentProgress = tv.targetProgress;
       }
 
