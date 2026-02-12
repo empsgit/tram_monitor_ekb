@@ -398,14 +398,11 @@ class VehicleTracker:
                 for stop, eta_s in etas
             ]
 
-        # --- Route matching (map position): no smoothing, no extrapolation ---
-        # Route matcher expects a numeric course. If movement bearing is unavailable
-        # (e.g. vehicle has moved <30m), fall back to API course to avoid crashes.
-        match_course = movement_bearing if movement_bearing is not None else rv.course
-        match = self.route_matcher.match(route_id, rv.lat, rv.lon, match_course)
-
-        MAX_APPLY_SNAP_DISTANCE_M = 60.0
-        if match and match.distance_m <= MAX_APPLY_SNAP_DISTANCE_M:
+        # --- Route matching (for progress tracking only, NOT for position) ---
+        # We keep progress for potential animation use but NEVER override
+        # the real GPS coordinates — the ETTU API positions are accurate.
+        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing)
+        if match:
             raw_progress = match.progress
 
             # Section-bound projection check from detected prev/next stops.
@@ -465,26 +462,8 @@ class VehicleTracker:
                     })
                     bounded_progress = prev_progress
 
-            snapped = self.route_matcher.interpolate_progress(route_id, bounded_progress)
-            if snapped:
-                snap_error_m = _haversine(rv.lat, rv.lon, snapped[0], snapped[1])
-                MAX_FINAL_SNAP_ERROR_M = 80.0
-                if snap_error_m <= MAX_FINAL_SNAP_ERROR_M:
-                    state.progress = bounded_progress
-                    state.lat, state.lon = snapped
-                else:
-                    state.progress = None
-                    self._log_projection_event("snap_rejected_error", {
-                        "vehicle_id": rv.dev_id,
-                        "route_id": route_id,
-                        "snap_error_m": round(snap_error_m, 2),
-                        "raw_lat": rv.lat,
-                        "raw_lon": rv.lon,
-                        "snap_lat": round(snapped[0], 6),
-                        "snap_lon": round(snapped[1], 6),
-                    })
-            else:
-                state.progress = None
+            state.progress = smoothed
+            # Do NOT snap lat/lon — use raw GPS from API
         else:
             state.progress = None
             if match:
