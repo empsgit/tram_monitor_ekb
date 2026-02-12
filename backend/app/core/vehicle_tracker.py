@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import math
+from collections import deque
 
 import httpx
 from sqlalchemy import text
@@ -72,6 +73,9 @@ class VehicleTracker:
         # Route stop IDs (named only) for frontend filtering
         self._route_stop_ids: dict[int, list[int]] = {}
 
+        # Stop progress cache on route geometry: route_id -> {stop_id -> progress 0..1}
+        self._route_stop_progress: dict[int, dict[int, float]] = {}
+
         # stop_id -> set of route_ids that serve it
         self._stop_to_routes: dict[int, set[int]] = {}
 
@@ -86,7 +90,7 @@ class VehicleTracker:
 
         # Per-vehicle smoothing state for progress and speed
         self._smooth: dict[str, dict] = {}
-        # {vehicle_id: {"progress": float, "speed": float, "direction": int, "route_id": int}}
+        # {vehicle_id: {"progress": float | None, "speed": float, "direction": int, "route_id": int}}
 
         # Recent GPS positions for bearing calculation (last 3 points)
         self._recent_positions: dict[str, list[tuple[float, float]]] = {}
@@ -107,6 +111,7 @@ class VehicleTracker:
         # Diagnostics: track unresolved stop IDs per route
         self._diag_unresolved: dict[int, list[int]] = {}  # route_id -> [stop_ids not in points]
         self._diag_total_path_stops: dict[int, int] = {}  # route_id -> total path entries
+        self._projection_events: deque[dict] = deque(maxlen=500)
 
     # Cache TTL constants
     STOPS_CACHE_TTL = 7 * 86400  # 7 days for stops (rarely change)
@@ -208,6 +213,16 @@ class VehicleTracker:
             if route.points:
                 self._route_geometries[route.id] = route.points
                 self.route_matcher.load_route(route.id, route.points)
+
+                # Precompute stop progress on geometry for section-bound checks.
+                stop_prog: dict[int, float] = {}
+                for s in route.stops:
+                    if s["lat"] == 0 or s["lon"] == 0:
+                        continue
+                    m = self.route_matcher.match(route.id, s["lat"], s["lon"], 0.0)
+                    if m and m.distance_m <= 120:
+                        stop_prog[s["id"]] = m.progress
+                self._route_stop_progress[route.id] = stop_prog
 
             # Load stops for this route (only named stops for the detector).
             # No geometry projection needed — the detector uses GPS distances
@@ -345,12 +360,9 @@ class VehicleTracker:
                 movement_bearing = rv.course
         # If movement_bearing is None, detection relies on preferred_direction
 
-        # --- Speed smoothing (simple EMA, independent of route matching) ---
+        # --- Disable smoothing: use raw instantaneous speed ---
         prev = self._smooth.get(rv.dev_id)
-        if prev and prev["route_id"] == route_id:
-            smoothed_speed = prev["speed"] * 0.6 + rv.speed * 0.4
-        else:
-            smoothed_speed = rv.speed
+        smoothed_speed = rv.speed
 
         # --- Stop detection (GPS-based, uses ETTU stop order) ---
         # Use previous direction as hint for sticky detection
@@ -384,35 +396,87 @@ class VehicleTracker:
                 for stop, eta_s in etas
             ]
 
-        # --- Route matching (for map display only: snapping + animation) ---
-        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing)
-        if match:
+        # --- Route matching (map position): no smoothing, no extrapolation ---
+        # Route matcher expects a numeric course. If movement bearing is unavailable
+        # (e.g. vehicle has moved <30m), fall back to API course to avoid crashes.
+        match_course = movement_bearing if movement_bearing is not None else rv.course
+        match = self.route_matcher.match(route_id, rv.lat, rv.lon, match_course)
+
+        MAX_APPLY_SNAP_DISTANCE_M = 60.0
+        if match and match.distance_m <= MAX_APPLY_SNAP_DISTANCE_M:
             raw_progress = match.progress
 
-            MAX_DELTA = 0.05
-            if prev and prev["route_id"] == route_id and prev["direction"] == direction:
-                alpha = 0.4
-                smoothed = prev["progress"] * (1 - alpha) + raw_progress * alpha
-                if direction == 0:
-                    smoothed = max(smoothed, prev["progress"])
-                else:
-                    smoothed = min(smoothed, prev["progress"])
-                delta = smoothed - prev["progress"]
-                if abs(delta) > MAX_DELTA:
-                    smoothed = prev["progress"] + MAX_DELTA * (1 if delta > 0 else -1)
-            else:
-                smoothed = raw_progress
+            # Section-bound projection check from detected prev/next stops.
+            stop_prog = self._route_stop_progress.get(route_id, {})
+            sec_prev = detection.prev_stop.stop_id if detection.prev_stop else None
+            sec_next = detection.next_stops[0].stop_id if detection.next_stops else None
+            bounded_progress = raw_progress
+            if sec_prev is not None and sec_next is not None:
+                p0 = stop_prog.get(sec_prev)
+                p1 = stop_prog.get(sec_next)
+                if p0 is not None and p1 is not None:
+                    lo, hi = (p0, p1) if p0 <= p1 else (p1, p0)
+                    if raw_progress < lo - 0.01 or raw_progress > hi + 0.01:
+                        logger.warning(
+                            "Vehicle %s route %s: projection %.3f outside section [%s->%s]=[%.3f,%.3f]",
+                            rv.dev_id, route_id, raw_progress, sec_prev, sec_next, lo, hi,
+                        )
+                        self._log_projection_event("out_of_section", {
+                            "vehicle_id": rv.dev_id,
+                            "route_id": route_id,
+                            "raw_progress": round(raw_progress, 6),
+                            "section_prev_stop": sec_prev,
+                            "section_next_stop": sec_next,
+                            "section_lo": round(lo, 6),
+                            "section_hi": round(hi, 6),
+                        })
+                        bounded_progress = min(max(raw_progress, lo), hi)
 
-            state.progress = smoothed
-            snapped = self.route_matcher.interpolate_progress(route_id, smoothed)
+            # Enforce forward movement within selected direction.
+            prev_progress = prev.get("progress") if prev and prev.get("route_id") == route_id else None
+            if prev_progress is not None:
+                if direction == 0 and bounded_progress + 0.001 < prev_progress:
+                    logger.warning(
+                        "Vehicle %s route %s: backward projection %.3f -> %.3f (dir=0)",
+                        rv.dev_id, route_id, prev_progress, bounded_progress,
+                    )
+                    self._log_projection_event("backward_projection", {
+                        "vehicle_id": rv.dev_id,
+                        "route_id": route_id,
+                        "direction": 0,
+                        "prev_progress": round(prev_progress, 6),
+                        "new_progress": round(bounded_progress, 6),
+                    })
+                    bounded_progress = prev_progress
+                elif direction == 1 and bounded_progress - 0.001 > prev_progress:
+                    logger.warning(
+                        "Vehicle %s route %s: backward projection %.3f -> %.3f (dir=1)",
+                        rv.dev_id, route_id, prev_progress, bounded_progress,
+                    )
+                    self._log_projection_event("backward_projection", {
+                        "vehicle_id": rv.dev_id,
+                        "route_id": route_id,
+                        "direction": 1,
+                        "prev_progress": round(prev_progress, 6),
+                        "new_progress": round(bounded_progress, 6),
+                    })
+                    bounded_progress = prev_progress
+
+            state.progress = bounded_progress
+            snapped = self.route_matcher.interpolate_progress(route_id, bounded_progress)
             if snapped:
                 state.lat, state.lon = snapped
         else:
-            smoothed = prev["progress"] if prev and prev["route_id"] == route_id else None
-            state.progress = smoothed
+            state.progress = None
+            if match:
+                self._log_projection_event("snap_rejected_far", {
+                    "vehicle_id": rv.dev_id,
+                    "route_id": route_id,
+                    "distance_m": round(match.distance_m, 2),
+                })
 
         self._smooth[rv.dev_id] = {
-            "progress": smoothed if smoothed is not None else 0,
+            "progress": state.progress,
             "speed": smoothed_speed,
             "direction": direction,
             "route_id": route_id,
@@ -797,6 +861,26 @@ out geom;
                 await session.commit()
         except Exception:
             logger.exception("Failed to persist route_stops to database")
+
+    def _log_projection_event(self, kind: str, payload: dict) -> None:
+        event = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "kind": kind,
+            **payload,
+        }
+        self._projection_events.append(event)
+
+    def get_projection_diagnostics(self, limit: int = 100) -> dict:
+        events = list(self._projection_events)[-max(1, min(limit, 500)):]
+        counts: dict[str, int] = {}
+        for e in self._projection_events:
+            k = e.get("kind", "unknown")
+            counts[k] = counts.get(k, 0) + 1
+        return {
+            "events_total": len(self._projection_events),
+            "counts": counts,
+            "latest": events,
+        }
 
     def get_diagnostics(self) -> dict:
         """Get pipeline diagnostics for debugging route-stop resolution."""
