@@ -440,6 +440,15 @@ class VehicleTracker:
             state.progress = bounded_progress
             snapped = self.route_matcher.interpolate_progress(route_id, bounded_progress)
             if snapped:
+                snap_error_m = _haversine(rv.lat, rv.lon, snapped[0], snapped[1])
+                if snap_error_m > MAX_SNAP_ERROR_M:
+                    # Smoothing produced a point too far from observed GPS.
+                    # Fall back to the nearest on-route projection from current GPS.
+                    smoothed = raw_progress
+                    snapped = self.route_matcher.interpolate_progress(route_id, smoothed)
+
+            state.progress = smoothed
+            if snapped:
                 state.lat, state.lon = snapped
         else:
             state.progress = None
