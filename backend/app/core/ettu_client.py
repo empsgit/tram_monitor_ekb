@@ -1,6 +1,7 @@
 """Async client for the ETTU (Gortrans) API at map.ettu.ru."""
 
 import asyncio
+import datetime
 import logging
 from dataclasses import dataclass, field
 
@@ -17,6 +18,20 @@ LAYER_TRAM = 0
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 4, 8]  # seconds between retries
 
+# ETTU timestamps are in Asia/Yekaterinburg (UTC+5)
+_EKB_TZ = datetime.timezone(datetime.timedelta(hours=5))
+
+
+def _parse_atime(raw: str) -> datetime.datetime | None:
+    """Parse ETTU ATIME string like '2026-02-13 16:30:42' (Yekaterinburg local) to UTC datetime."""
+    if not raw:
+        return None
+    try:
+        local = datetime.datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_EKB_TZ)
+        return local.astimezone(datetime.timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
 
 @dataclass
 class RawVehicle:
@@ -30,6 +45,7 @@ class RawVehicle:
     on_route: bool
     layer: int
     timestamp: str = ""
+    atime_utc: datetime.datetime | None = None  # parsed ATIME in UTC
 
 
 @dataclass
@@ -118,6 +134,7 @@ class EttuClient:
                 layer = int(item.get("LAYER", item.get("layer", -1)))
                 on_route = item.get("ON_ROUTE", item.get("on_route", 0))
 
+                raw_ts = str(item.get("ATIME", item.get("TIMESTAMP", item.get("timestamp", ""))))
                 vehicle = RawVehicle(
                     dev_id=str(item.get("DEV_ID", item.get("dev_id", ""))),
                     board_num=str(item.get("BOARD_NUM", item.get("board_num", item.get("gos_num", "")))),
@@ -128,7 +145,8 @@ class EttuClient:
                     course=float(item.get("COURSE", item.get("course", item.get("dir", 0)))),
                     on_route=bool(int(on_route)) if on_route is not None else False,
                     layer=layer,
-                    timestamp=str(item.get("ATIME", item.get("TIMESTAMP", item.get("timestamp", "")))),
+                    timestamp=raw_ts,
+                    atime_utc=_parse_atime(raw_ts),
                 )
                 # Include trams with valid coordinates and a route assigned
                 if vehicle.lat != 0 and vehicle.lon != 0 and vehicle.route_num:
