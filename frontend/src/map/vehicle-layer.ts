@@ -299,12 +299,25 @@ export class VehicleLayer {
           : v.progress;
         const targetHasServerProgress = v.progress != null;
 
-        // Set new target (rendering happens in RAF interpolation loop).
+        // Set new target (rendering happens immediately below).
         tv.targetLat = v.lat;
         tv.targetLon = v.lon;
-        // Keep previous heading while stopped to avoid random spins at 0 km/h.
-        tv.targetCourse = v.speed <= STATIONARY_SPEED_KMH ? tv.currentCourse : v.course;
         tv.targetSpeed = v.speed;
+
+        // Compute heading from actual movement direction (prev → target).
+        // Much more reliable than the raw ETTU API course field which uses
+        // a different angular convention and is often stale.
+        if (v.speed <= STATIONARY_SPEED_KMH) {
+          tv.targetCourse = tv.currentCourse; // Keep heading when stationary
+        } else {
+          const dLat = v.lat - tv.prevLat;
+          const dLon = (v.lon - tv.prevLon) * Math.cos(v.lat * DEG2RAD);
+          if (Math.abs(dLat) + Math.abs(dLon) > 0.00001) {
+            tv.targetCourse = (Math.atan2(dLon, dLat) * 180 / Math.PI + 360) % 360;
+          } else {
+            tv.targetCourse = tv.currentCourse;
+          }
+        }
 
         let nextTargetProgress = targetProgress;
         if (hasGeom && nextTargetProgress != null && tv.currentProgress != null) {
@@ -345,8 +358,8 @@ export class VehicleLayer {
             if (Math.abs(delta) > 0.0001) dir = delta >= 0 ? 1 : -1;
           }
           if (dir == null) {
-            const motionCourse = (tv.targetCourse - 90 + 360) % 360;
-            dir = absAngleDiffDeg(motionCourse, renderCourse) > 90 ? -1 : 1;
+            // targetCourse is now computed from movement atan2, same convention as renderCourse
+            dir = absAngleDiffDeg(tv.targetCourse, renderCourse) > 90 ? -1 : 1;
           }
           if (dir < 0) renderCourse = (renderCourse + 180) % 360;
         }
@@ -509,7 +522,6 @@ export class VehicleLayer {
 
   private updateHeading(marker: L.Marker, course: number): void {
     const el = (marker as any)._icon as HTMLElement | undefined;
-    const fixedCourse = (course - 90 + 360) % 360; 
     if (!el) return;
     const inner = el.querySelector(".tram-marker") as HTMLElement | null;
     if (inner) inner.style.transform = `rotate(${course}deg)`;
