@@ -1072,7 +1072,7 @@ out geom;
                 if stop_coords:
                     dist = _haversine(state.lat, state.lon, stop_coords[0], stop_coords[1])
                     avg_speed_ms = max(state.speed, 15) / 3.6
-                    eta = dist / avg_speed_ms if avg_speed_ms > 0 else None
+                    eta = round(dist / avg_speed_ms) if avg_speed_ms > 0 else None
 
             # Filter by ETA window
             if eta is not None and eta > MAX_ETA_SECONDS:
@@ -1083,7 +1083,7 @@ out geom;
                 "board_num": state.board_num,
                 "route": state.route,
                 "route_id": state.route_id,
-                "eta_seconds": eta,
+                "eta_seconds": round(eta) if eta is not None else None,
             })
 
         arrivals.sort(key=lambda a: a.get("eta_seconds") or 9999)
