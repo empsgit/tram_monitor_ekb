@@ -84,6 +84,17 @@ class EttuClient:
                 else:
                     logger.error("%s failed after %d attempts: %s", label, MAX_RETRIES + 1, e)
                     return None
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code >= 500 and attempt < MAX_RETRIES:
+                    wait = RETRY_BACKOFF[attempt]
+                    logger.warning(
+                        "%s attempt %d/%d got HTTP %d, retrying in %ds",
+                        label, attempt + 1, MAX_RETRIES + 1, e.response.status_code, wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error("Failed to fetch %s from ETTU: %s", label, e)
+                    return None
             except Exception:
                 logger.exception("Failed to fetch %s from ETTU", label)
                 return None

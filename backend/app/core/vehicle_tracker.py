@@ -177,9 +177,9 @@ class VehicleTracker:
             self._diag_total_path_stops[route.id] = total_path
             if unresolved_ids:
                 self._diag_unresolved[route.id] = unresolved_ids
-                logger.warning(
-                    "Route %s (%s): %d/%d stops unresolved: %s",
-                    route.number, route.name, len(unresolved_ids), total_path, unresolved_ids[:10],
+                logger.info(
+                    "Route %s (%s): %d/%d path entries are intermediate waypoints (no stop data)",
+                    route.number, route.name, len(unresolved_ids), total_path,
                 )
 
             # Build stop-route association
@@ -384,6 +384,20 @@ class VehicleTracker:
         )
         direction = detection.direction
 
+        # Terminal handling: if ≤1 next stop remains, the vehicle is near the end
+        # of the route (terminal).  Re-detect without sticky preference to allow
+        # direction switch on bidirectional routes.
+        near_terminal = len(detection.next_stops) <= 1
+        if near_terminal:
+            alt = self.stop_detector.detect(
+                route_id, rv.lat, rv.lon, movement_bearing,
+                max_next=50, preferred_direction=None,
+            )
+            if len(alt.next_stops) > len(detection.next_stops):
+                detection = alt
+                direction = alt.direction
+                near_terminal = False  # switched to a direction with more stops
+
         # Store full next stops for station arrival queries
         self._vehicle_all_next_stops[rv.dev_id] = detection.next_stops
 
@@ -479,7 +493,8 @@ class VehicleTracker:
         self._smooth[rv.dev_id] = {
             "progress": internal_progress,
             "speed": smoothed_speed,
-            "direction": direction,
+            # Clear sticky direction at terminals so next poll can freely detect
+            "direction": None if near_terminal else direction,
             "route_id": route_id,
         }
 

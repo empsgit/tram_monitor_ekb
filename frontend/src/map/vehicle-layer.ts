@@ -403,28 +403,14 @@ export class VehicleLayer {
         }
         tv.currentProgress = progress;
       } else {
-        lat = tv.prevLat + (tv.targetLat - tv.prevLat) * easedT;
-        lon = tv.prevLon + (tv.targetLon - tv.prevLon) * easedT;
-        course = lerpAngle(tv.prevCourse, tv.targetCourse, easedT);
-
-        // After interpolation phase, extrapolate along course at reported speed
-        // so the marker keeps moving smoothly between server updates.
-        if (
-          !tv.signalLost &&
-          tv.targetSpeed >= MIN_MOVING_SPEED_KMH &&
-          elapsed > INTERP_DURATION
-        ) {
-          const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
-          const meters = Math.min(
-            (tv.targetSpeed / 3.6) * (extraMs / 1000),
-            MAX_ROUTE_EXTRAP_METERS,
-          );
-          const cRad = tv.targetCourse * DEG2RAD;
-          const cosLat = Math.cos(tv.targetLat * DEG2RAD);
-          lat = tv.targetLat + (meters * Math.cos(cRad)) / M_PER_DEG_LAT;
-          lon = tv.targetLon + (meters * Math.sin(cRad)) / (M_PER_DEG_LAT * cosLat);
-          course = tv.targetCourse;
-        }
+        // Spread linear interpolation over the full poll interval (~10 s)
+        // so the marker moves at constant speed between server updates.
+        const LATLON_INTERP_MS = 10000;
+        const tLL = Math.min(1, elapsed / LATLON_INTERP_MS);
+        lat = tv.prevLat + (tv.targetLat - tv.prevLat) * tLL;
+        lon = tv.prevLon + (tv.targetLon - tv.prevLon) * tLL;
+        // Rotate heading faster so direction updates promptly
+        course = lerpAngle(tv.prevCourse, tv.targetCourse, Math.min(1, elapsed / 2000));
 
         tv.currentProgress = tv.targetProgress;
       }
