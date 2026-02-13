@@ -167,6 +167,8 @@ function inferTravelDir(
   return absAngleDiffDeg(targetCourse, routeBearing) > 90 ? -1 : 1;
 }
 
+const VEHICLE_PANE = "vehiclePane";
+
 export class VehicleLayer {
   private tracked: Map<string, TrackedVehicle> = new Map();
   private layerGroup: L.LayerGroup;
@@ -176,6 +178,9 @@ export class VehicleLayer {
   private routeGeometries: Map<number, RouteGeometry> = new Map();
 
   constructor(map: L.Map) {
+    // Create a custom pane: above route lines (overlayPane z=400) but below stops (stopPane z=450)
+    const pane = map.createPane(VEHICLE_PANE);
+    pane.style.zIndex = "420";
     this.layerGroup = L.layerGroup().addTo(map);
     // Animation loop is intentionally disabled for now.
   }
@@ -397,7 +402,7 @@ export class VehicleLayer {
 
         const marker = L.marker([initialLat, initialLon], {
           icon: createIcon(v.route, v.signal_lost),
-          zIndexOffset: 100,
+          pane: VEHICLE_PANE,
         });
         marker.bindPopup(this.popupHtml(v));
         marker.addTo(this.layerGroup);

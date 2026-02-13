@@ -338,13 +338,14 @@ html, body {
 
 .tram-marker .tram-arrow {
   position: absolute;
-  top: -6px;
+  top: -8px;
   left: 50%;
+  transform: translateX(-50%);
   width: 0;
   height: 0;
-  border-left: 4px solid transparent;
-  border-right: 4px solid transparent;
-  border-bottom: 6px solid rgba(0,0,0,0.3);
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 8px solid rgba(0,0,0,0.6);
 }
 
 .tram-marker .tram-label {

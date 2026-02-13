@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import math
+import time
 from collections import deque
 
 import httpx
@@ -104,6 +105,10 @@ class VehicleTracker:
         # Full next-stops list per vehicle (for station arrival queries)
         # vehicle_id -> [StopOnRoute] (all remaining stops, not just first 5)
         self._vehicle_all_next_stops: dict[str, list[StopOnRoute]] = {}
+
+        # Stable arrival cache: prevents flickering in stop arrivals list.
+        # {stop_id: {vehicle_id: last_confirmed_monotonic_time}}
+        self._arrival_cache: dict[int, dict[str, float]] = {}
 
         # Ghost vehicle tracking: vehicle_id -> last seen UTC timestamp
         self._last_seen: dict[str, datetime.datetime] = {}
@@ -309,6 +314,9 @@ class VehicleTracker:
 
             for vid in expired:
                 del self._last_seen[vid]
+
+            # Update stable arrival cache (prevents stop arrivals flickering)
+            self._refresh_arrival_cache()
 
             # Publish all vehicles (live + ghosts) to subscribers
             vehicles_data = [s.model_dump() for s in states]
@@ -947,27 +955,101 @@ out geom;
             "routes": sorted(route_diags, key=lambda r: r["route_number"]),
         }
 
+    def _refresh_arrival_cache(self) -> None:
+        """Update stable arrival cache after each poll cycle.
+
+        Vehicles are added when detected heading to a stop.  They're removed
+        only when they've clearly passed the stop or haven't been confirmed
+        for >60 s.  This prevents flickering caused by noisy detection.
+        """
+        now = time.monotonic()
+        STALE_SECONDS = 60  # keep for up to 60 s after last confirmation
+
+        # Step 1: Confirm current detections
+        for vid, next_stops in self._vehicle_all_next_stops.items():
+            state = self.current_states.get(vid)
+            if not state or state.signal_lost:
+                continue
+            for ns in next_stops:
+                self._arrival_cache.setdefault(ns.stop_id, {})[vid] = now
+
+        # Step 2: Prune stale / passed entries
+        for stop_id in list(self._arrival_cache):
+            entries = self._arrival_cache[stop_id]
+            for vid in list(entries):
+                # Vehicle no longer tracked at all
+                if vid not in self.current_states:
+                    del entries[vid]
+                    continue
+                # Vehicle has clearly passed the stop
+                if self._has_passed_stop(vid, stop_id):
+                    del entries[vid]
+                    continue
+                # Not confirmed for too long
+                if now - entries[vid] > STALE_SECONDS:
+                    del entries[vid]
+                    continue
+            if not entries:
+                del self._arrival_cache[stop_id]
+
+    def _has_passed_stop(self, vid: str, target_stop_id: int) -> bool:
+        """Check if vehicle has passed the target stop based on stop ordering."""
+        state = self.current_states.get(vid)
+        if not state or not state.prev_stop or not state.route_id:
+            return False
+
+        # If vehicle's prev_stop IS the target stop, it just passed it
+        if state.prev_stop.id == target_stop_id:
+            return True
+
+        # Check order in the vehicle's current direction
+        smooth = self._smooth.get(vid, {})
+        direction = smooth.get("direction")
+        if direction is None:
+            return False
+
+        dir_stops = self.stop_detector._stops.get(state.route_id, {}).get(direction, [])
+        target_order = None
+        prev_order = None
+        for s in dir_stops:
+            if s.stop_id == target_stop_id:
+                target_order = s.order
+            if s.stop_id == state.prev_stop.id:
+                prev_order = s.order
+
+        if target_order is not None and prev_order is not None:
+            return prev_order >= target_order
+
+        return False
+
     def get_vehicles_for_stop(
         self, stop_id: int, route_filter: int | None = None
     ) -> list[dict]:
-        """Get upcoming vehicles for a specific stop.
+        """Get upcoming vehicles for a specific stop using the stable arrival cache.
 
-        Only includes vehicles that have this stop genuinely ahead of them
-        on their current route and direction. No distance-based fallback —
-        a vehicle must have the stop in its detected next_stops to appear.
+        Uses a cached arrivals list that is updated every poll cycle.  Vehicles
+        are kept in the list even if one detection cycle temporarily misses them
+        (e.g. direction flip-flop).  A vehicle is removed only when it has clearly
+        passed the stop or hasn't been confirmed for >60 s.
         """
+        MAX_ETA_SECONDS = 5400  # 1.5 hours
+
         arrivals = []
         serving_routes = self._stop_to_routes.get(stop_id, set())
+        cached = self._arrival_cache.get(stop_id, {})
 
-        for vid, state in self.current_states.items():
-            if not state.route_id or state.route_id not in serving_routes:
+        for vid in cached:
+            state = self.current_states.get(vid)
+            if not state or not state.route_id:
+                continue
+            if state.route_id not in serving_routes:
                 continue
             if route_filter and state.route_id != route_filter:
                 continue
             if state.signal_lost:
-                continue  # Don't show ghost vehicles in station arrivals
+                continue
 
-            # Check full next-stops list (all remaining stops on this direction)
+            # Try to compute ETA from current detection
             all_next = self._vehicle_all_next_stops.get(vid, [])
             stops_to_target = []
             found = False
@@ -977,17 +1059,24 @@ out geom;
                     found = True
                     break
 
-            if not found:
-                continue
-
-            # Calculate ETA to this specific stop along the route
             eta = None
-            if stops_to_target:
+            if found and stops_to_target:
                 calc = self.eta_calculator.calculate(
                     state.lat, state.lon, state.speed, stops_to_target
                 )
                 if calc:
-                    _, eta = calc[-1]  # ETA to the target stop (last in list)
+                    _, eta = calc[-1]
+            else:
+                # Stop not in current detection — estimate from direct distance
+                stop_coords = self._stop_coords.get(stop_id)
+                if stop_coords:
+                    dist = _haversine(state.lat, state.lon, stop_coords[0], stop_coords[1])
+                    avg_speed_ms = max(state.speed, 15) / 3.6
+                    eta = dist / avg_speed_ms if avg_speed_ms > 0 else None
+
+            # Filter by ETA window
+            if eta is not None and eta > MAX_ETA_SECONDS:
+                continue
 
             arrivals.append({
                 "vehicle_id": state.id,
