@@ -106,6 +106,9 @@ class VehicleTracker:
         # vehicle_id -> [StopOnRoute] (all remaining stops, not just first 5)
         self._vehicle_all_next_stops: dict[str, list[StopOnRoute]] = {}
 
+        # Per-vehicle data age (seconds since ATIME) for ETA correction in arrivals
+        self._vehicle_data_age: dict[str, float] = {}
+
         # Stable arrival cache: prevents flickering in stop arrivals list.
         # {stop_id: {vehicle_id: last_confirmed_monotonic_time}}
         self._arrival_cache: dict[int, dict[str, float]] = {}
@@ -284,12 +287,22 @@ class VehicleTracker:
                 if prev_state and prev_state.signal_lost:
                     self._recent_positions.pop(rv.dev_id, None)
 
-                state = self._process_vehicle(rv)
+                # Compute data age from ATIME for ETA correction
+                data_age_s = 0.0
+                if rv.atime_utc:
+                    data_age_s = max(0.0, (now - rv.atime_utc).total_seconds())
+                    # Clamp to reasonable range (clock skew / stale data)
+                    if data_age_s > 300:
+                        data_age_s = 0.0  # Ignore clearly wrong timestamps
+
+                state = self._process_vehicle(rv, data_age_s=data_age_s)
                 if state:
                     state.signal_lost = False
                     states.append(state)
                     self.current_states[state.id] = state
-                    self._last_seen[state.id] = now
+                    self._vehicle_data_age[state.id] = data_age_s
+                    # Use ATIME for last_seen if available (more accurate for ghost detection)
+                    self._last_seen[state.id] = rv.atime_utc or now
                     current_ids.add(state.id)
                     self._record_stop_passage(state, now)
 
@@ -330,11 +343,12 @@ class VehicleTracker:
         except Exception:
             logger.exception("Error in vehicle poll cycle")
 
-    def _process_vehicle(self, rv: RawVehicle) -> VehicleState | None:
+    def _process_vehicle(self, rv: RawVehicle, data_age_s: float = 0.0) -> VehicleState | None:
         """Process a single raw vehicle through the pipeline.
 
         Stop detection is GPS-based (independent of route geometry).
         Route geometry is only used for visual snapping + animation progress.
+        data_age_s: seconds since ATIME — subtracted from ETAs.
         """
         route_id = self._route_num_to_id.get(rv.route_num)
 
@@ -421,8 +435,13 @@ class VehicleTracker:
             etas = self.eta_calculator.calculate(
                 rv.lat, rv.lon, smoothed_speed, display_stops
             )
+            age_correction = int(data_age_s)
             state.next_stops = [
-                NextStopInfo(id=stop.stop_id, name=stop.name, eta_seconds=eta_s)
+                NextStopInfo(
+                    id=stop.stop_id,
+                    name=stop.name,
+                    eta_seconds=max(0, eta_s - age_correction) if eta_s is not None else None,
+                )
                 for stop, eta_s in etas
             ]
 
@@ -1073,6 +1092,11 @@ out geom;
                     dist = _haversine(state.lat, state.lon, stop_coords[0], stop_coords[1])
                     avg_speed_ms = max(state.speed, 15) / 3.6
                     eta = round(dist / avg_speed_ms) if avg_speed_ms > 0 else None
+
+            # Subtract data age (time since ATIME) from ETA
+            if eta is not None:
+                age = int(self._vehicle_data_age.get(vid, 0))
+                eta = max(0, eta - age)
 
             # Filter by ETA window
             if eta is not None and eta > MAX_ETA_SECONDS:
