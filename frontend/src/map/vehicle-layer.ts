@@ -432,7 +432,79 @@ export class VehicleLayer {
    * Otherwise falls back to linear lat/lon interpolation.
    */
   private interpolateAll(): void {
-    // Animation is disabled; positions are updated in update().
+    const now = performance.now();
+
+    for (const [, tv] of this.tracked) {
+      const elapsed = Math.max(0, now - tv.updateTime);
+      const t = Math.min(1, elapsed / INTERP_DURATION);
+      const easedT = easeOutQuad(t);
+
+      let lat: number;
+      let lon: number;
+      let course: number;
+
+      const geom = tv.routeId != null ? this.routeGeometries.get(tv.routeId) : undefined;
+      const useRoutedAnimation = geom && tv.prevProgress != null && tv.targetProgress != null;
+
+      if (useRoutedAnimation) {
+        const travelDir = inferTravelDir(
+          geom!,
+          tv.prevProgress!,
+          tv.targetProgress!,
+          tv.targetCourse,
+        );
+        let progress =
+          tv.prevProgress! + (tv.targetProgress! - tv.prevProgress!) * easedT;
+
+        const canExtrapolate =
+          tv.targetHasServerProgress &&
+          !tv.signalLost &&
+          tv.targetSpeed >= MIN_MOVING_SPEED_KMH &&
+          elapsed > INTERP_DURATION;
+        if (canExtrapolate) {
+          const extraMs = Math.min(elapsed - INTERP_DURATION, MAX_EXTRAP_MS);
+          const bySpeedMeters = (tv.targetSpeed / 3.6) * (extraMs / 1000);
+          const extrapMeters = Math.min(bySpeedMeters, MAX_ROUTE_EXTRAP_METERS);
+          const dProgress = geom!.totalDist > 0 ? extrapMeters / geom!.totalDist : 0;
+          progress = tv.targetProgress! + dProgress * travelDir;
+        }
+
+        progress = Math.max(0, Math.min(1, progress));
+        const pos = pointAtProgress(geom!, progress);
+        lat = pos[0];
+        lon = pos[1];
+        course = bearingAtProgress(geom!, progress);
+        if (travelDir < 0) {
+          course = (course + 180) % 360;
+        }
+        tv.currentProgress = progress;
+      } else {
+        // Spread linear interpolation over the full poll interval (~10 s)
+        // so the marker moves at constant speed between server updates.
+        const LATLON_INTERP_MS = 10000;
+        const tLL = Math.min(1, elapsed / LATLON_INTERP_MS);
+        lat = tv.prevLat + (tv.targetLat - tv.prevLat) * tLL;
+        lon = tv.prevLon + (tv.targetLon - tv.prevLon) * tLL;
+        // Rotate heading faster so direction updates promptly
+        course = lerpAngle(tv.prevCourse, tv.targetCourse, Math.min(1, elapsed / 2000));
+
+        tv.currentProgress = tv.targetProgress;
+      }
+
+      if (
+        Math.abs(lat - tv.currentLat) > 0.0000005 ||
+        Math.abs(lon - tv.currentLon) > 0.0000005
+      ) {
+        tv.marker.setLatLng([lat, lon]);
+        tv.currentLat = lat;
+        tv.currentLon = lon;
+      }
+
+      if (Math.abs(course - tv.currentCourse) > 0.3) {
+        this.updateHeading(tv.marker, course);
+        tv.currentCourse = course;
+      }
+    }
   }
 
   private updateHeading(marker: L.Marker, course: number): void {

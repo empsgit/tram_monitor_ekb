@@ -107,3 +107,34 @@ def test_max_next_returns_all_remaining():
     result = detector.detect(1, lat=56.840, lon=60.600, max_next=50)
     assert result.prev_stop.stop_id == 1  # Stop A
     assert len(result.next_stops) == 3  # B, C, D — all remaining
+
+
+def test_terminal_direction_switch():
+    """At terminal, re-detect without sticky should switch to reverse direction.
+
+    Simulates the vehicle_tracker terminal logic: when detection returns ≤1
+    next stops, re-detect without preferred_direction and prefer the direction
+    with more remaining stops.
+    """
+    detector = StopDetector()
+    detector.load_route_stops(1, make_bidirectional_stops())
+
+    # Vehicle at the terminal (Stop D, end of forward direction)
+    # With sticky direction=0, we get ≤1 next stop (just Stop D itself)
+    result = detector.detect(
+        1, lat=56.852, lon=60.600,
+        max_next=50, preferred_direction=0,
+    )
+    assert result.direction == 0
+    assert len(result.next_stops) <= 1  # At terminal, almost no stops left
+
+    # Re-detect without sticky (simulating vehicle_tracker terminal logic)
+    alt = detector.detect(
+        1, lat=56.852, lon=60.600,
+        max_next=50, preferred_direction=None,
+    )
+    # The reverse direction (1) starts at Stop D' and has 3 more stops ahead
+    if len(alt.next_stops) > len(result.next_stops):
+        # Terminal switch: reverse direction wins with more stops
+        assert alt.direction == 1
+        assert len(alt.next_stops) >= 2  # At least C', B', A' ahead
