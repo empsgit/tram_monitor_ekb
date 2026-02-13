@@ -148,6 +148,25 @@ class StopDetector:
 
         return best or DetectionResult(prev_stop=None, next_stops=[], direction=0)
 
+    def detect_in_direction(
+        self,
+        route_id: int,
+        direction: int,
+        lat: float,
+        lon: float,
+        max_next: int = 5,
+    ) -> DetectionResult:
+        """Find prev/next stops for a fixed direction (no cross-direction scoring)."""
+        stops = self._stops.get(route_id, {}).get(direction, [])
+        if not stops:
+            return DetectionResult(prev_stop=None, next_stops=[], direction=direction)
+
+        closest_idx, _ = self._find_nearest_stop(stops, lat, lon)
+        prev_idx = self._infer_prev_stop_index(stops, closest_idx, lat, lon)
+        next_list = stops[prev_idx + 1: prev_idx + 1 + max_next]
+        prev_stop = stops[prev_idx] if stops else None
+        return DetectionResult(prev_stop=prev_stop, next_stops=next_list, direction=direction)
+
     # ------------------------------------------------------------------
 
     @staticmethod

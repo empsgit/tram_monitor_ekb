@@ -4,7 +4,8 @@ import { getStopArrivals, type StopInfo } from "../services/api-client";
 import { store } from "../services/state";
 import { flyTo } from "../map/map-controller";
 
-function formatEta(seconds: number | null | undefined): string {
+function formatEta(seconds: number | null | undefined, signalLost = false): string {
+  if (signalLost) return "Нет сигнала";
   if (seconds == null) return "—";
   if (seconds < 60) return "<1 мин";
   return `${Math.ceil(seconds / 60)} мин`;
@@ -74,7 +75,7 @@ export async function renderStationDetail(
             <span class="arrival-route" style="color:var(--accent)">${a.route}</span>
             <span style="color:var(--text-muted);font-size:12px;margin-left:6px">#${a.board_num}</span>
           </div>
-          <div class="arrival-eta">${formatEta(a.eta_seconds)}</div>
+          <div class="arrival-eta">${formatEta(a.eta_seconds, a.signal_lost)}</div>
         </div>
       `;
     }

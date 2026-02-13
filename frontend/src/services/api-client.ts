@@ -26,6 +26,7 @@ export interface StopArrivals {
     route: string;
     route_id: number;
     eta_seconds: number | null;
+    signal_lost: boolean;
   }>;
 }
 

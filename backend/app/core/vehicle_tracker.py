@@ -328,8 +328,7 @@ class VehicleTracker:
             for vid in expired:
                 del self._last_seen[vid]
 
-            # Update stable arrival cache (prevents stop arrivals flickering)
-            self._refresh_arrival_cache()
+            # Arrivals are now derived directly from current vehicle states on request.
 
             # Publish all vehicles (live + ghosts) to subscribers
             vehicles_data = [s.model_dump() for s in states]
@@ -394,31 +393,58 @@ class VehicleTracker:
         prev = self._smooth.get(rv.dev_id)
         smoothed_speed = rv.speed
 
-        # --- Stop detection (GPS-based, uses ETTU stop order) ---
-        # Use previous direction as hint for sticky detection
+        # --- Stop detection with stateful direction ---
+        # Determine direction once, keep it, and switch only after terminal turn-around.
         prev_direction = None
-        if prev and prev["route_id"] == route_id:
+        prev_terminal_dist_m = None
+        prev_terminal_min_dist_m = None
+        if prev and prev.get("route_id") == route_id:
             prev_direction = prev.get("direction")
+            prev_terminal_dist_m = prev.get("terminal_distance_m")
+            prev_terminal_min_dist_m = prev.get("terminal_min_distance_m")
 
-        detection = self.stop_detector.detect(
-            route_id, rv.lat, rv.lon, movement_bearing,
-            max_next=50, preferred_direction=prev_direction,
-        )
-        direction = detection.direction
-
-        # Terminal handling: if ≤1 next stop remains, the vehicle is near the end
-        # of the route (terminal).  Re-detect without sticky preference to allow
-        # direction switch on bidirectional routes.
-        near_terminal = len(detection.next_stops) <= 1
-        if near_terminal:
-            alt = self.stop_detector.detect(
+        if prev_direction is None:
+            detection = self.stop_detector.detect(
                 route_id, rv.lat, rv.lon, movement_bearing,
-                max_next=50, preferred_direction=None,
+                max_next=200, preferred_direction=None,
             )
-            if len(alt.next_stops) > len(detection.next_stops):
-                detection = alt
-                direction = alt.direction
-                near_terminal = False  # switched to a direction with more stops
+            direction = detection.direction
+        else:
+            direction = int(prev_direction)
+            detection = self.stop_detector.detect_in_direction(
+                route_id, direction, rv.lat, rv.lon, max_next=200
+            )
+
+        near_terminal = len(detection.next_stops) <= 1
+        terminal_distance_m = None
+        terminal_min_dist_m = None
+
+        if near_terminal:
+            dir_stops = self.stop_detector._stops.get(route_id, {}).get(direction, [])
+            if dir_stops:
+                terminal = dir_stops[-1]
+                terminal_distance_m = _haversine(rv.lat, rv.lon, terminal.lat, terminal.lon)
+                prev_min = float(prev_terminal_min_dist_m) if prev_terminal_min_dist_m is not None else terminal_distance_m
+                terminal_min_dist_m = min(prev_min, terminal_distance_m)
+
+                # Switch direction only when the vehicle was close to terminal and now moves away.
+                departed_terminal = (
+                    prev_terminal_dist_m is not None
+                    and float(prev_terminal_dist_m) < 180
+                    and terminal_distance_m > float(prev_terminal_dist_m) + 30
+                    and rv.speed > 3
+                )
+                if departed_terminal:
+                    available_dirs = list(self.stop_detector._stops.get(route_id, {}).keys())
+                    alt_dirs = [d for d in available_dirs if d != direction]
+                    if alt_dirs:
+                        direction = alt_dirs[0]
+                        detection = self.stop_detector.detect_in_direction(
+                            route_id, direction, rv.lat, rv.lon, max_next=200
+                        )
+                        near_terminal = len(detection.next_stops) <= 1
+                        terminal_distance_m = None
+                        terminal_min_dist_m = None
 
         # Store full next stops for station arrival queries
         self._vehicle_all_next_stops[rv.dev_id] = detection.next_stops
@@ -520,9 +546,11 @@ class VehicleTracker:
         self._smooth[rv.dev_id] = {
             "progress": internal_progress,
             "speed": smoothed_speed,
-            # Clear sticky direction at terminals so next poll can freely detect
-            "direction": None if near_terminal else direction,
+            # Direction is stateful; switch only after terminal turn-around.
+            "direction": direction,
             "route_id": route_id,
+            "terminal_distance_m": terminal_distance_m,
+            "terminal_min_distance_m": terminal_min_dist_m,
         }
 
         return state
@@ -1044,33 +1072,60 @@ out geom;
     def get_vehicles_for_stop(
         self, stop_id: int, route_filter: int | None = None
     ) -> list[dict]:
-        """Get upcoming vehicles for a specific stop using the stable arrival cache.
+        """Get upcoming vehicles for a stop from current state + fixed direction.
 
-        Uses a cached arrivals list that is updated every poll cycle.  Vehicles
-        are kept in the list even if one detection cycle temporarily misses them
-        (e.g. direction flip-flop).  A vehicle is removed only when it has clearly
-        passed the stop or hasn't been confirmed for >60 s.
+        A vehicle is shown when:
+        - its route serves this stop,
+        - it is on the stop's direction for that route,
+        - it has not passed the stop yet.
         """
         MAX_ETA_SECONDS = 5400  # 1.5 hours
 
         arrivals = []
         serving_routes = self._stop_to_routes.get(stop_id, set())
-        cached = self._arrival_cache.get(stop_id, {})
+        stops_cache: dict[tuple[int, int], list[StopOnRoute]] = {}
+        order_cache: dict[tuple[int, int], dict[int, int]] = {}
 
-        for vid in cached:
-            state = self.current_states.get(vid)
-            if not state or not state.route_id:
+        for vid, state in self.current_states.items():
+            if not state.route_id:
                 continue
             if state.route_id not in serving_routes:
                 continue
             if route_filter and state.route_id != route_filter:
                 continue
-            if state.signal_lost:
+
+            smooth = self._smooth.get(vid, {})
+            direction = smooth.get("direction")
+            if direction is None:
+                continue
+            direction = int(direction)
+
+            key = (state.route_id, direction)
+            if key not in stops_cache:
+                dir_stops = self.stop_detector._stops.get(state.route_id, {}).get(direction, [])
+                stops_cache[key] = dir_stops
+                order_cache[key] = {s.stop_id: s.order for s in dir_stops}
+            dir_stops = stops_cache[key]
+            order_by_stop = order_cache[key]
+            if not dir_stops:
                 continue
 
-            # Try to compute ETA from current detection
+            target_order = order_by_stop.get(stop_id)
+            if target_order is None:
+                # This route serves the physical stop, but not in this direction.
+                continue
+
+            prev_order = None
+            if state.prev_stop:
+                prev_order = order_by_stop.get(state.prev_stop.id)
+
+            # Already passed this stop in current direction.
+            if prev_order is not None and prev_order >= target_order:
+                continue
+
+            # Build stop chain to target for ETA calculation.
             all_next = self._vehicle_all_next_stops.get(vid, [])
-            stops_to_target = []
+            stops_to_target: list[StopOnRoute] = []
             found = False
             for ns in all_next:
                 stops_to_target.append(ns)
@@ -1078,29 +1133,41 @@ out geom;
                     found = True
                     break
 
-            eta = None
-            if found and stops_to_target:
-                calc = self.eta_calculator.calculate(
-                    state.lat, state.lon, state.speed, stops_to_target
+            if not found and prev_order is not None and prev_order < target_order:
+                stops_to_target = []
+                for s in dir_stops:
+                    if s.order <= prev_order:
+                        continue
+                    stops_to_target.append(s)
+                    if s.stop_id == stop_id:
+                        found = True
+                        break
+
+            if not found:
+                # Recompute on demand in fixed direction (no cross-direction scoring).
+                det = self.stop_detector.detect_in_direction(
+                    state.route_id, direction, state.lat, state.lon, max_next=200
                 )
+                stops_to_target = []
+                for ns in det.next_stops:
+                    stops_to_target.append(ns)
+                    if ns.stop_id == stop_id:
+                        found = True
+                        break
+
+            if not found:
+                continue
+
+            eta = None
+            if not state.signal_lost and stops_to_target:
+                calc = self.eta_calculator.calculate(state.lat, state.lon, state.speed, stops_to_target)
                 if calc:
                     _, eta = calc[-1]
-            else:
-                # Stop not in current detection — estimate from direct distance
-                stop_coords = self._stop_coords.get(stop_id)
-                if stop_coords:
-                    dist = _haversine(state.lat, state.lon, stop_coords[0], stop_coords[1])
-                    avg_speed_ms = max(state.speed, 15) / 3.6
-                    eta = round(dist / avg_speed_ms) if avg_speed_ms > 0 else None
-
-            # Subtract data age (time since ATIME) from ETA
-            if eta is not None:
-                age = int(self._vehicle_data_age.get(vid, 0))
-                eta = max(0, eta - age)
-
-            # Filter by ETA window
-            if eta is not None and eta > MAX_ETA_SECONDS:
-                continue
+                if eta is not None:
+                    age = int(self._vehicle_data_age.get(vid, 0))
+                    eta = max(0, eta - age)
+                    if eta > MAX_ETA_SECONDS:
+                        continue
 
             arrivals.append({
                 "vehicle_id": state.id,
@@ -1108,7 +1175,14 @@ out geom;
                 "route": state.route,
                 "route_id": state.route_id,
                 "eta_seconds": round(eta) if eta is not None else None,
+                "signal_lost": state.signal_lost,
             })
 
-        arrivals.sort(key=lambda a: a.get("eta_seconds") or 9999)
+        # Live vehicles with ETA first; no-signal vehicles last.
+        arrivals.sort(
+            key=lambda a: (
+                1 if a.get("signal_lost") else 0,
+                a.get("eta_seconds") if a.get("eta_seconds") is not None else 999999,
+            )
+        )
         return arrivals[:15]

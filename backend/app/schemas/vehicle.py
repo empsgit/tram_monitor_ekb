@@ -45,6 +45,7 @@ class StopArrival(BaseModel):
     route_id: int | None = None
     eta_seconds: int | None = None
     distance_m: float | None = None
+    signal_lost: bool = False
 
 
 class StopArrivals(BaseModel):
