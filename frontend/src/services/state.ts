@@ -11,6 +11,7 @@ export interface AppState {
   stops: StopInfo[];
   enabledRoutes: Set<string>; // route numbers
   selectedStop: number | null;
+  highlightedVehicleIds: Set<string>;
   connected: boolean;
 }
 
@@ -21,6 +22,7 @@ class Store {
     stops: [],
     enabledRoutes: new Set(),
     selectedStop: null,
+    highlightedVehicleIds: new Set(),
     connected: false,
   };
 
@@ -81,6 +83,16 @@ class Store {
 
   selectStop(stopId: number | null): void {
     this.state.selectedStop = stopId;
+    if (stopId == null) {
+      this.state.highlightedVehicleIds = new Set();
+    }
+    this.notify();
+  }
+
+  setHighlightedVehicles(vehicleIds: Iterable<string> | null): void {
+    this.state.highlightedVehicleIds = vehicleIds
+      ? new Set(vehicleIds)
+      : new Set();
     this.notify();
   }
 

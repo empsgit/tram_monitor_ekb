@@ -252,6 +252,33 @@ html, body {
   margin-bottom: 12px;
 }
 
+.station-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.station-header-row .station-name {
+  margin-bottom: 0;
+}
+
+.station-clear-btn {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.station-clear-btn:hover {
+  border-color: var(--accent-blue);
+  color: var(--text);
+}
+
 .arrival-row {
   display: flex;
   align-items: center;
@@ -334,6 +361,13 @@ html, body {
   border: 2px solid rgba(0,0,0,0.2);
   box-shadow: 0 2px 8px rgba(0,0,0,0.25);
   transform-origin: center;
+}
+
+.tram-marker.tram-target {
+  border-color: #10b981;
+  box-shadow:
+    0 0 0 3px rgba(16,185,129,0.25),
+    0 3px 10px rgba(0,0,0,0.3);
 }
 
 .tram-marker .tram-arrow {

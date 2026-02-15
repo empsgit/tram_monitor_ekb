@@ -15,6 +15,23 @@ function stopDisplayName(stop: StopInfo): string {
   return stop.direction ? `${stop.name} (${stop.direction})` : stop.name;
 }
 
+function stationHeader(stop: StopInfo): string {
+  return `
+    <div class="station-header-row">
+      <div class="station-name">${stopDisplayName(stop)}</div>
+      <button class="station-clear-btn" type="button" data-action="clear-stop">Сбросить</button>
+    </div>
+  `;
+}
+
+function bindClearSelection(container: HTMLElement): void {
+  const clearBtn = container.querySelector<HTMLButtonElement>('[data-action="clear-stop"]');
+  if (!clearBtn) return;
+  clearBtn.addEventListener("click", () => {
+    store.selectStop(null);
+  });
+}
+
 export function renderStopSearch(
   searchInput: HTMLInputElement,
   container: HTMLElement
@@ -53,21 +70,25 @@ export async function renderStationDetail(
   stop: StopInfo
 ): Promise<void> {
   container.innerHTML = `
-    <div class="station-name">${stopDisplayName(stop)}</div>
+    ${stationHeader(stop)}
     <div style="color:var(--text-muted);padding:12px">Загрузка...</div>
   `;
+  bindClearSelection(container);
 
   try {
     const data = await getStopArrivals(stop.id);
+    store.setHighlightedVehicles(data.arrivals.map((a) => a.vehicle_id));
+
     if (data.arrivals.length === 0) {
       container.innerHTML = `
-        <div class="station-name">${stopDisplayName(stop)}</div>
+        ${stationHeader(stop)}
         <div style="color:var(--text-muted);padding:12px;text-align:center">Нет ближайших трамваев</div>
       `;
+      bindClearSelection(container);
       return;
     }
 
-    let html = `<div class="station-name">${stopDisplayName(stop)}</div>`;
+    let html = stationHeader(stop);
     for (const a of data.arrivals) {
       html += `
         <div class="arrival-row">
@@ -80,11 +101,14 @@ export async function renderStationDetail(
       `;
     }
     container.innerHTML = html;
+    bindClearSelection(container);
   } catch {
+    store.setHighlightedVehicles(null);
     container.innerHTML = `
-      <div class="station-name">${stopDisplayName(stop)}</div>
+      ${stationHeader(stop)}
       <div style="color:var(--accent);padding:12px">Ошибка загрузки</div>
     `;
+    bindClearSelection(container);
   }
 }
 

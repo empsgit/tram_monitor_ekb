@@ -41,10 +41,14 @@ export class StopLayer {
       });
 
       marker.on("click", () => {
-        store.selectStop(stop.id);
-        document.querySelector('.tab[data-tab="station"]')?.dispatchEvent(
-          new Event("click")
-        );
+        if (store.state.selectedStop === stop.id) {
+          store.selectStop(null);
+        } else {
+          store.selectStop(stop.id);
+          document.querySelector('.tab[data-tab="station"]')?.dispatchEvent(
+            new Event("click")
+          );
+        }
       });
 
       marker.addTo(this.layerGroup);

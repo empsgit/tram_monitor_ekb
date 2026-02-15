@@ -125,6 +125,7 @@ async function main() {
   store.subscribe(() => {
     const visible = store.getVisibleVehicles();
     vehicleLayer.update(visible);
+    vehicleLayer.setHighlightedVehicles(store.state.highlightedVehicleIds);
     renderVehicleList(vehicleListEl, visible);
     vehicleCount.textContent = `${visible.length} трамваев`;
 
@@ -143,10 +144,17 @@ async function main() {
     if (store.state.selectedStop !== lastSelectedStop) {
       lastSelectedStop = store.state.selectedStop;
       if (lastSelectedStop != null) {
+        store.setHighlightedVehicles(null);
         const stop = store.state.stops.find((s) => s.id === lastSelectedStop);
         if (stop) {
           void renderStationDetail(stationDetailEl, stop);
         }
+      } else {
+        stationDetailEl.innerHTML = `
+          <div style="color:var(--text-muted);padding:12px;text-align:center">
+            Остановка не выбрана
+          </div>
+        `;
       }
     }
   });

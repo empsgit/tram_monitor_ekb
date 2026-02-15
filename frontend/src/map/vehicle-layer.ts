@@ -173,6 +173,7 @@ export class VehicleLayer {
   private tracked: Map<string, TrackedVehicle> = new Map();
   private layerGroup: L.LayerGroup;
   private rafId: number = 0;
+  private highlightedVehicleIds: Set<string> = new Set();
 
   // Route geometry index for progress → position lookup
   private routeGeometries: Map<number, RouteGeometry> = new Map();
@@ -193,6 +194,11 @@ export class VehicleLayer {
         this.routeGeometries.set(route.id, buildRouteGeometry(route.geometry));
       }
     }
+  }
+
+  setHighlightedVehicles(vehicleIds: Set<string>): void {
+    this.highlightedVehicleIds = new Set(vehicleIds);
+    this.applyAllVehicleHighlights();
   }
 
   /** Kick off the continuous animation loop. */
@@ -387,6 +393,7 @@ export class VehicleLayer {
           tv.route = v.route;
           tv.signalLost = v.signal_lost;
         }
+        this.applyVehicleHighlight(tv.marker, this.highlightedVehicleIds.has(v.id));
         tv.marker.setPopupContent(this.popupHtml(v));
       } else {
         let initialLat = v.lat;
@@ -407,6 +414,7 @@ export class VehicleLayer {
         marker.bindPopup(this.popupHtml(v));
         marker.addTo(this.layerGroup);
         this.updateHeading(marker, initialCourse);
+        this.applyVehicleHighlight(marker, this.highlightedVehicleIds.has(v.id));
 
         this.tracked.set(v.id, {
           marker,
@@ -532,6 +540,20 @@ export class VehicleLayer {
     if (inner) inner.style.transform = `rotate(${course}deg)`;
     const label = el.querySelector(".tram-label") as HTMLElement | null;
     if (label) label.style.transform = `rotate(-${course}deg)`;
+  }
+
+  private applyAllVehicleHighlights(): void {
+    for (const [vid, tv] of this.tracked) {
+      this.applyVehicleHighlight(tv.marker, this.highlightedVehicleIds.has(vid));
+    }
+  }
+
+  private applyVehicleHighlight(marker: L.Marker, highlighted: boolean): void {
+    const el = (marker as any)._icon as HTMLElement | undefined;
+    if (!el) return;
+    const inner = el.querySelector(".tram-marker") as HTMLElement | null;
+    if (!inner) return;
+    inner.classList.toggle("tram-target", highlighted);
   }
 
   private popupHtml(v: VehicleData): string {
