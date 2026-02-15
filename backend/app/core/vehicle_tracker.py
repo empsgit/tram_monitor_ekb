@@ -750,8 +750,17 @@ out geom;
             logger.exception("Failed to update cache timestamp for %s", cache_key)
 
     # Ekaterinburg is UTC+5; skip travel time recording during night (no trams running)
-    _EKB_UTC_OFFSET = 5
+    _EKB_TZ = datetime.timezone(datetime.timedelta(hours=5))
     _NIGHT_HOURS = range(0, 5)  # 00:00–04:59 local = no service
+    _DOW_KEYS = (
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    )
 
     def _record_stop_passage(self, state: VehicleState, now: datetime.datetime) -> None:
         """Track when a vehicle passes a stop; record travel time between consecutive stops."""
@@ -765,18 +774,13 @@ out geom;
             elapsed = (now - prev["time"]).total_seconds()
             # Sanity: only record if 10s < elapsed < 30min (filters GPS glitches)
             if 10 < elapsed < 1800:
-                local_hour = (now.hour + self._EKB_UTC_OFFSET) % 24
+                local_now = now.astimezone(self._EKB_TZ)
+                local_hour = local_now.hour
                 # Skip night hours — no regular service, data would be unreliable
                 if local_hour in self._NIGHT_HOURS:
                     pass
                 else:
-                    dow = now.weekday()
-                    if dow < 5:
-                        day_type = "weekday"
-                    elif dow == 5:
-                        day_type = "saturday"
-                    else:
-                        day_type = "sunday"
+                    day_type = self._DOW_KEYS[local_now.weekday()]
 
                     self._travel_time_batch.append({
                         "route_id": state.route_id,

@@ -382,9 +382,9 @@ html, body {
   border-bottom: 8px solid rgba(0,0,0,0.6);
 }
 
-.tram-marker .tram-label {
+/* .tram-marker .tram-label {
 }
-
+*/
 .stop-marker {
   width: 10px;
   height: 10px;

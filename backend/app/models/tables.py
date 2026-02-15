@@ -104,7 +104,7 @@ class TravelTimeSegment(Base):
     route_id: Mapped[int] = mapped_column(Integer, ForeignKey("routes.id"), nullable=False)
     from_stop_id: Mapped[int] = mapped_column(Integer, ForeignKey("stops.id"), nullable=False)
     to_stop_id: Mapped[int] = mapped_column(Integer, ForeignKey("stops.id"), nullable=False)
-    day_type: Mapped[str] = mapped_column(String(10), nullable=False)  # weekday, saturday, sunday
+    day_type: Mapped[str] = mapped_column(String(10), nullable=False)  # monday..sunday
     hour: Mapped[int] = mapped_column(Integer, nullable=False)  # 0-23
     median_seconds: Mapped[float] = mapped_column(Float, nullable=False)
     p25_seconds: Mapped[float] = mapped_column(Float, nullable=True)
