@@ -11,6 +11,7 @@ from collections import deque
 import httpx
 from sqlalchemy import text
 
+from app.config import settings
 from app.core.broadcaster import Broadcaster
 from app.core.eta_calculator import EtaCalculator
 from app.core.ettu_client import EttuClient, RawRoute, RawStop, RawVehicle
@@ -63,6 +64,7 @@ class VehicleTracker:
         self.route_matcher = RouteMatcher()
         self.stop_detector = StopDetector()
         self.eta_calculator = EtaCalculator()
+        self._debug_scalar_prediction = settings.debug_scalar_prediction
 
         # route_num -> route_id mapping
         self._route_num_to_id: dict[str, int] = {}
@@ -272,6 +274,13 @@ class VehicleTracker:
     # How long to keep a vehicle on the map after it disappears from API
     GHOST_TTL_SECONDS = 120  # 2 minutes
 
+    # Scalar progress predictor tuning (backend-side smoothing).
+    _STOPPED_SPEED_KMH = 0.1
+    _MAX_PREDICT_AGE_S = 120.0
+    _MAX_EST_SPEED_MPS = 25.0
+    _PRED_GAIN_NORMAL = 0.65
+    _PRED_GAIN_AFTER_STOP = 0.9
+
     async def poll_vehicles(self) -> None:
         """Single poll cycle: fetch positions, process, publish (including ghost vehicles)."""
         try:
@@ -473,11 +482,7 @@ class VehicleTracker:
                 for stop, eta_s in etas
             ]
 
-        # --- Route matching (progress tracking for diagnostics, NOT for frontend position) ---
-        # The frontend uses progress to position markers on route geometry via
-        # pointAtProgress(). Since OSM geometry is forward-only and projection can be
-        # wrong, we track progress internally but DON'T send it to the frontend.
-        # The frontend will use raw lat/lon from the API instead.
+        # --- Route matching (scalar progress on route geometry) ---
         internal_progress = None
         match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing or rv.course)
         if match:
@@ -542,20 +547,143 @@ class VehicleTracker:
 
             internal_progress = bounded_progress
 
-        # Don't send progress to frontend — it uses raw lat/lon from API
-        state.progress = None
+        render_progress, v_est_mps, stopped_now = self._predict_render_progress(
+            route_id=route_id,
+            direction=direction,
+            measured_progress=internal_progress,
+            rv=rv,
+            data_age_s=data_age_s,
+            prev=prev,
+        )
+        state.progress = render_progress
 
         self._smooth[rv.dev_id] = {
             "progress": internal_progress,
+            "render_progress": render_progress,
             "speed": smoothed_speed,
             # Direction is stateful; switch only after terminal turn-around.
             "direction": direction,
             "route_id": route_id,
             "terminal_distance_m": terminal_distance_m,
             "terminal_min_distance_m": terminal_min_dist_m,
+            "v_est_mps": v_est_mps,
+            "stopped": stopped_now,
+            "atime_utc": rv.atime_utc,
         }
 
         return state
+
+    def _predict_render_progress(
+        self,
+        route_id: int,
+        direction: int,
+        measured_progress: float | None,
+        rv: RawVehicle,
+        data_age_s: float,
+        prev: dict | None,
+    ) -> tuple[float | None, float, bool]:
+        """Predict progress at 'now' from measured progress and ATIME.
+
+        Rules:
+        - Use ATIME-based age for prediction (not poll cadence).
+        - No backward movement along the chosen direction.
+        - If API speed is zero, converge to measured point and stop there.
+        - After standing still, catch up faster when movement resumes.
+        """
+        stopped_now = rv.speed <= self._STOPPED_SPEED_KMH
+        prev_v = 0.0
+        prev_meas = None
+        prev_render = None
+        prev_stopped = False
+        prev_atime = None
+        dt_meas = None
+        v_meas = None
+        gain = None
+
+        if prev and prev.get("route_id") == route_id:
+            prev_v = float(prev.get("v_est_mps") or 0.0)
+            prev_meas = prev.get("progress")
+            prev_render = prev.get("render_progress")
+            prev_stopped = bool(prev.get("stopped"))
+            prev_atime = prev.get("atime_utc")
+
+        if measured_progress is None:
+            return (prev_render, prev_v, stopped_now)
+
+        route_len_m = self.route_matcher.get_total_length(route_id)
+        if route_len_m <= 1:
+            return (measured_progress, 0.0 if stopped_now else max(rv.speed, 0.0) / 3.6, stopped_now)
+
+        dir_sign = 1.0 if direction == 0 else -1.0
+        v_api = max(rv.speed, 0.0) / 3.6
+
+        # Estimate scalar speed from measured progress and ATIME spacing.
+        if (
+            prev_meas is not None
+            and rv.atime_utc is not None
+            and isinstance(prev_atime, datetime.datetime)
+        ):
+            dt_meas = (rv.atime_utc - prev_atime).total_seconds()
+            if 1.0 <= dt_meas <= 180.0:
+                delta_dir = dir_sign * (measured_progress - float(prev_meas))
+                if delta_dir < 0:
+                    delta_dir = 0.0
+                v_meas = (delta_dir * route_len_m) / dt_meas
+
+        if stopped_now:
+            v_est = 0.0
+        else:
+            if v_meas is None:
+                v_est = 0.65 * v_api + 0.35 * prev_v
+            else:
+                v_est = 0.55 * v_meas + 0.35 * v_api + 0.10 * prev_v
+            v_est = max(0.0, min(v_est, self._MAX_EST_SPEED_MPS))
+
+        # Predict from measurement time to "now" by ATIME age.
+        age_s = max(0.0, min(data_age_s, self._MAX_PREDICT_AGE_S))
+        target = measured_progress
+        if not stopped_now:
+            target += dir_sign * (v_est * age_s / route_len_m)
+        target = max(0.0, min(1.0, target))
+
+        if prev_render is None:
+            render = target
+        elif stopped_now:
+            # If API reports full stop, clamp exactly to measured point and freeze.
+            render = target
+        else:
+            gain = self._PRED_GAIN_AFTER_STOP if prev_stopped else self._PRED_GAIN_NORMAL
+            blended = float(prev_render) + (target - float(prev_render)) * gain
+            if direction == 0:
+                render = max(float(prev_render), blended)
+            else:
+                render = min(float(prev_render), blended)
+
+        render = max(0.0, min(1.0, render))
+
+        if self._debug_scalar_prediction:
+            self._log_projection_event("scalar_prediction", {
+                "vehicle_id": rv.dev_id,
+                "route_id": route_id,
+                "direction": direction,
+                "measured_progress": round(measured_progress, 6),
+                "render_progress": round(render, 6),
+                "target_progress": round(target, 6),
+                "data_age_s": round(data_age_s, 2),
+                "speed_kmh": round(rv.speed, 2),
+                "stopped": stopped_now,
+                "v_api_mps": round(v_api, 3),
+                "v_meas_mps": round(v_meas, 3) if v_meas is not None else None,
+                "v_est_mps": round(v_est, 3),
+                "dt_meas_s": round(dt_meas, 2) if dt_meas is not None else None,
+                "prev_progress": round(float(prev_meas), 6) if prev_meas is not None else None,
+                "prev_render_progress": round(float(prev_render), 6) if prev_render is not None else None,
+                "prev_stopped": prev_stopped,
+                "gain": gain,
+                "atime_utc": rv.atime_utc.isoformat() if rv.atime_utc else None,
+            })
+
+        return (render, v_est, stopped_now)
 
     async def _fetch_osrm_geometry(
         self, stops: list[dict]
@@ -848,6 +976,10 @@ out geom;
                     route_id = self._route_num_to_id.get(rv.route_num)
                     state = self.current_states.get(rv.dev_id)
                     progress = state.progress if state else None
+                    smooth = self._smooth.get(rv.dev_id, {})
+                    if smooth.get("progress") is not None:
+                        # Persist measured route-match progress for analytics.
+                        progress = smooth.get("progress")
 
                     await session.execute(
                         text("""
@@ -1005,6 +1137,7 @@ out geom;
             "total_vehicles": total_vehicles,
             "vehicles_matched_to_route": matched,
             "vehicles_unmatched": total_vehicles - matched,
+            "debug_scalar_prediction": self._debug_scalar_prediction,
             "routes": sorted(route_diags, key=lambda r: r["route_number"]),
         }
 
