@@ -119,6 +119,8 @@ async function main() {
 
   wsClient.connect();
 
+  let lastSelectedStop: number | null = null;
+
   // Re-render when route filter changes
   store.subscribe(() => {
     const visible = store.getVisibleVehicles();
@@ -135,6 +137,17 @@ async function main() {
     // Highlight selected stop
     if (store.state.selectedStop) {
       stopLayer.highlightStop(store.state.selectedStop);
+    }
+
+    // Open station details immediately on stop selection (no 15s wait).
+    if (store.state.selectedStop !== lastSelectedStop) {
+      lastSelectedStop = store.state.selectedStop;
+      if (lastSelectedStop != null) {
+        const stop = store.state.stops.find((s) => s.id === lastSelectedStop);
+        if (stop) {
+          void renderStationDetail(stationDetailEl, stop);
+        }
+      }
     }
   });
 }

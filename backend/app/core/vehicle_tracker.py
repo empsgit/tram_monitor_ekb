@@ -109,9 +109,10 @@ class VehicleTracker:
         # Per-vehicle data age (seconds since ATIME) for ETA correction in arrivals
         self._vehicle_data_age: dict[str, float] = {}
 
-        # Stable arrival cache: prevents flickering in stop arrivals list.
-        # {stop_id: {vehicle_id: last_confirmed_monotonic_time}}
-        self._arrival_cache: dict[int, dict[str, float]] = {}
+        # Precomputed per-stop arrivals snapshot, rebuilt each poll cycle.
+        # {stop_id: [arrival_dict, ...]}
+        self._stop_arrivals_snapshot: dict[int, list[dict]] = {}
+        self._stop_arrivals_updated_monotonic: float = 0.0
 
         # Ghost vehicle tracking: vehicle_id -> last seen UTC timestamp
         self._last_seen: dict[str, datetime.datetime] = {}
@@ -328,7 +329,8 @@ class VehicleTracker:
             for vid in expired:
                 del self._last_seen[vid]
 
-            # Arrivals are now derived directly from current vehicle states on request.
+            # Rebuild per-stop arrivals snapshot in background (once per poll cycle).
+            self._rebuild_stop_arrivals_snapshot()
 
             # Publish all vehicles (live + ghosts) to subscribers
             vehicles_data = [s.model_dump() for s in states]
@@ -1002,183 +1004,109 @@ out geom;
             "routes": sorted(route_diags, key=lambda r: r["route_number"]),
         }
 
-    def _refresh_arrival_cache(self) -> None:
-        """Update stable arrival cache after each poll cycle.
-
-        Vehicles are added when detected heading to a stop.  They're removed
-        only when they've clearly passed the stop or haven't been confirmed
-        for >60 s.  This prevents flickering caused by noisy detection.
-        """
-        now = time.monotonic()
-        STALE_SECONDS = 60  # keep for up to 60 s after last confirmation
-
-        # Step 1: Confirm current detections
-        for vid, next_stops in self._vehicle_all_next_stops.items():
-            state = self.current_states.get(vid)
-            if not state or state.signal_lost:
-                continue
-            for ns in next_stops:
-                self._arrival_cache.setdefault(ns.stop_id, {})[vid] = now
-
-        # Step 2: Prune stale / passed entries
-        for stop_id in list(self._arrival_cache):
-            entries = self._arrival_cache[stop_id]
-            for vid in list(entries):
-                # Vehicle no longer tracked at all
-                if vid not in self.current_states:
-                    del entries[vid]
-                    continue
-                # Vehicle has clearly passed the stop
-                if self._has_passed_stop(vid, stop_id):
-                    del entries[vid]
-                    continue
-                # Not confirmed for too long
-                if now - entries[vid] > STALE_SECONDS:
-                    del entries[vid]
-                    continue
-            if not entries:
-                del self._arrival_cache[stop_id]
-
-    def _has_passed_stop(self, vid: str, target_stop_id: int) -> bool:
-        """Check if vehicle has passed the target stop based on stop ordering."""
-        state = self.current_states.get(vid)
-        if not state or not state.prev_stop or not state.route_id:
-            return False
-
-        # If vehicle's prev_stop IS the target stop, it just passed it
-        if state.prev_stop.id == target_stop_id:
-            return True
-
-        # Check order in the vehicle's current direction
-        smooth = self._smooth.get(vid, {})
-        direction = smooth.get("direction")
-        if direction is None:
-            return False
-
-        dir_stops = self.stop_detector._stops.get(state.route_id, {}).get(direction, [])
-        target_order = None
-        prev_order = None
-        for s in dir_stops:
-            if s.stop_id == target_stop_id:
-                target_order = s.order
-            if s.stop_id == state.prev_stop.id:
-                prev_order = s.order
-
-        if target_order is not None and prev_order is not None:
-            return prev_order >= target_order
-
-        return False
-
-    def get_vehicles_for_stop(
-        self, stop_id: int, route_filter: int | None = None
-    ) -> list[dict]:
-        """Get upcoming vehicles for a stop from current state + fixed direction.
-
-        A vehicle is shown when:
-        - its route serves this stop,
-        - it is on the stop's direction for that route,
-        - it has not passed the stop yet.
-        """
+    def _rebuild_stop_arrivals_snapshot(self) -> None:
+        """Recompute arrivals for all stops from current vehicle states."""
         MAX_ETA_SECONDS = 5400  # 1.5 hours
 
-        arrivals = []
-        serving_routes = self._stop_to_routes.get(stop_id, set())
-        stops_cache: dict[tuple[int, int], list[StopOnRoute]] = {}
-        order_cache: dict[tuple[int, int], dict[int, int]] = {}
+        snapshot: dict[int, list[dict]] = {}
 
         for vid, state in self.current_states.items():
             if not state.route_id:
                 continue
-            if state.route_id not in serving_routes:
-                continue
-            if route_filter and state.route_id != route_filter:
-                continue
 
-            smooth = self._smooth.get(vid, {})
-            direction = smooth.get("direction")
-            if direction is None:
-                continue
-            direction = int(direction)
-
-            key = (state.route_id, direction)
-            if key not in stops_cache:
-                dir_stops = self.stop_detector._stops.get(state.route_id, {}).get(direction, [])
-                stops_cache[key] = dir_stops
-                order_cache[key] = {s.stop_id: s.order for s in dir_stops}
-            dir_stops = stops_cache[key]
-            order_by_stop = order_cache[key]
-            if not dir_stops:
+            next_stops = self._vehicle_all_next_stops.get(vid, [])
+            if not next_stops:
                 continue
 
-            target_order = order_by_stop.get(stop_id)
-            if target_order is None:
-                # This route serves the physical stop, but not in this direction.
-                continue
-
-            prev_order = None
-            if state.prev_stop:
-                prev_order = order_by_stop.get(state.prev_stop.id)
-
-            # Already passed this stop in current direction.
-            if prev_order is not None and prev_order >= target_order:
-                continue
-
-            # Build stop chain to target for ETA calculation.
-            all_next = self._vehicle_all_next_stops.get(vid, [])
-            stops_to_target: list[StopOnRoute] = []
-            found = False
-            for ns in all_next:
-                stops_to_target.append(ns)
-                if ns.stop_id == stop_id:
-                    found = True
-                    break
-
-            if not found and prev_order is not None and prev_order < target_order:
-                stops_to_target = []
-                for s in dir_stops:
-                    if s.order <= prev_order:
-                        continue
-                    stops_to_target.append(s)
-                    if s.stop_id == stop_id:
-                        found = True
-                        break
-
-            if not found:
-                # Recompute on demand in fixed direction (no cross-direction scoring).
-                det = self.stop_detector.detect_in_direction(
-                    state.route_id, direction, state.lat, state.lon, max_next=200
+            eta_by_stop: dict[int, int | None] = {}
+            if not state.signal_lost:
+                calc = self.eta_calculator.calculate(
+                    state.lat, state.lon, state.speed, next_stops
                 )
-                stops_to_target = []
-                for ns in det.next_stops:
-                    stops_to_target.append(ns)
-                    if ns.stop_id == stop_id:
-                        found = True
-                        break
+                age = int(self._vehicle_data_age.get(vid, 0))
+                for stop, eta in calc:
+                    if eta is not None:
+                        eta = max(0, eta - age)
+                        if eta > MAX_ETA_SECONDS:
+                            eta = None
+                    eta_by_stop[stop.stop_id] = eta
 
-            if not found:
+            for ns in next_stops:
+                eta = None if state.signal_lost else eta_by_stop.get(ns.stop_id)
+                snapshot.setdefault(ns.stop_id, []).append({
+                    "vehicle_id": state.id,
+                    "board_num": state.board_num,
+                    "route": state.route,
+                    "route_id": state.route_id,
+                    "eta_seconds": round(eta) if eta is not None else None,
+                    "signal_lost": state.signal_lost,
+                })
+
+        # Deduplicate per stop and keep stable sort order.
+        for stop_id, items in snapshot.items():
+            by_vehicle: dict[str, dict] = {}
+            for item in items:
+                prev = by_vehicle.get(item["vehicle_id"])
+                if prev is None:
+                    by_vehicle[item["vehicle_id"]] = item
+                    continue
+
+                prev_sig = bool(prev.get("signal_lost"))
+                new_sig = bool(item.get("signal_lost"))
+                prev_eta = prev.get("eta_seconds")
+                new_eta = item.get("eta_seconds")
+
+                if prev_sig and not new_sig:
+                    by_vehicle[item["vehicle_id"]] = item
+                    continue
+                if prev_sig == new_sig:
+                    p = prev_eta if prev_eta is not None else 999999
+                    n = new_eta if new_eta is not None else 999999
+                    if n < p:
+                        by_vehicle[item["vehicle_id"]] = item
+
+            deduped = list(by_vehicle.values())
+            deduped.sort(
+                key=lambda a: (
+                    1 if a.get("signal_lost") else 0,
+                    a.get("eta_seconds") if a.get("eta_seconds") is not None else 999999,
+                )
+            )
+            snapshot[stop_id] = deduped[:30]
+
+        self._stop_arrivals_snapshot = snapshot
+        self._stop_arrivals_updated_monotonic = time.monotonic()
+
+    def get_vehicles_for_stop(
+        self, stop_id: int, route_filter: int | None = None
+    ) -> list[dict]:
+        """Return arrivals from background snapshot with ETA age compensation."""
+        base = self._stop_arrivals_snapshot.get(stop_id, [])
+        if not base:
+            return []
+
+        snapshot_age_s = 0
+        if self._stop_arrivals_updated_monotonic > 0:
+            snapshot_age_s = int(max(0.0, time.monotonic() - self._stop_arrivals_updated_monotonic))
+
+        arrivals: list[dict] = []
+        for item in base:
+            if route_filter and item.get("route_id") != route_filter:
                 continue
 
-            eta = None
-            if not state.signal_lost and stops_to_target:
-                calc = self.eta_calculator.calculate(state.lat, state.lon, state.speed, stops_to_target)
-                if calc:
-                    _, eta = calc[-1]
-                if eta is not None:
-                    age = int(self._vehicle_data_age.get(vid, 0))
-                    eta = max(0, eta - age)
-                    if eta > MAX_ETA_SECONDS:
-                        continue
+            eta = item.get("eta_seconds")
+            if eta is not None and not item.get("signal_lost"):
+                eta = max(0, int(eta) - snapshot_age_s)
 
             arrivals.append({
-                "vehicle_id": state.id,
-                "board_num": state.board_num,
-                "route": state.route,
-                "route_id": state.route_id,
-                "eta_seconds": round(eta) if eta is not None else None,
-                "signal_lost": state.signal_lost,
+                "vehicle_id": item["vehicle_id"],
+                "board_num": item["board_num"],
+                "route": item["route"],
+                "route_id": item["route_id"],
+                "eta_seconds": eta,
+                "signal_lost": bool(item.get("signal_lost", False)),
             })
 
-        # Live vehicles with ETA first; no-signal vehicles last.
         arrivals.sort(
             key=lambda a: (
                 1 if a.get("signal_lost") else 0,
