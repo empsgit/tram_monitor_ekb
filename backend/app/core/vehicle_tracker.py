@@ -775,7 +775,7 @@ out geom;
             # Sanity: only record if 10s < elapsed < 60min (filters GPS glitches)
             if 10 < elapsed < 3600:
                 local_now = now.astimezone(self._EKB_TZ)
-                local_hour = (now.hour + self._EKB_UTC_OFFSET) % 24
+                local_hour = local_now.hour
                 # Skip night hours — no regular service, data would be unreliable
                 if local_hour in self._NIGHT_HOURS:
                     pass
