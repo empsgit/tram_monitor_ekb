@@ -751,7 +751,7 @@ out geom;
 
     # Ekaterinburg is UTC+5; skip travel time recording during night (no trams running)
     _EKB_TZ = datetime.timezone(datetime.timedelta(hours=5))
-    _NIGHT_HOURS = range(0, 5)  # 00:00–04:59 local = no service
+    _NIGHT_HOURS = range(1, 5)  # 00:00–04:59 local = no service
     _DOW_KEYS = (
         "monday",
         "tuesday",
@@ -772,10 +772,9 @@ out geom;
 
         if prev and prev["stop_id"] != current_stop_id and prev["route_id"] == state.route_id:
             elapsed = (now - prev["time"]).total_seconds()
-            # Sanity: only record if 10s < elapsed < 30min (filters GPS glitches)
-            if 10 < elapsed < 1800:
-                local_now = now.astimezone(self._EKB_TZ)
-                local_hour = local_now.hour
+            # Sanity: only record if 10s < elapsed < 60min (filters GPS glitches)
+            if 10 < elapsed < 3600:
+                local_hour = (now.hour + self._EKB_UTC_OFFSET) % 24
                 # Skip night hours — no regular service, data would be unreliable
                 if local_hour in self._NIGHT_HOURS:
                     pass
