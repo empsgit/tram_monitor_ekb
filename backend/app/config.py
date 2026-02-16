@@ -8,7 +8,6 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 10
     route_refresh_hours: int = 1
     position_retention_days: int = 90
-    debug_scalar_prediction: bool = False
 
     model_config = {"env_prefix": "", "case_sensitive": False}
 
