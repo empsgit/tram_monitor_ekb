@@ -22,6 +22,8 @@ async def list_routes(session: AsyncSession = Depends(get_session)):
     routes = result.scalars().all()
     route_infos = []
     for r in routes:
+        if tracker and r.id not in tracker._route_id_to_num:
+            continue
         geometry = None
         stop_ids: list[int] = []
         if tracker:
@@ -41,7 +43,7 @@ async def get_route(route_id: int, session: AsyncSession = Depends(get_session))
         select(Route).where(Route.id == route_id).options(selectinload(Route.stops).selectinload(RouteStop.stop))
     )
     route = result.scalar_one_or_none()
-    if not route:
+    if not route or (tracker and route_id not in tracker._route_id_to_num):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Route not found")
 

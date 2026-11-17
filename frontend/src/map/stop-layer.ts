@@ -9,6 +9,8 @@ const STOP_PANE = "stopPane";
 export class StopLayer {
   private markers: Map<number, L.CircleMarker> = new Map();
   private layerGroup: L.LayerGroup;
+  private activeIds: Set<number> | null = null;
+  private selectedId: number | null = null;
 
   constructor(map: L.Map) {
     // Create a custom pane above overlayPane (z-index 400) so stops sit above route lines
@@ -58,29 +60,33 @@ export class StopLayer {
 
   /** Dim stops not in the active set. Pass null to show all normally. */
   setDimming(activeStopIds: Set<number> | null): void {
-    for (const [id, m] of this.markers) {
-      if (activeStopIds === null || activeStopIds.has(id)) {
-        m.setStyle({ fillOpacity: 0.9, radius: 4, fillColor: "#60a5fa" });
-      } else {
-        m.setStyle({ fillOpacity: 0.15, radius: 3, fillColor: "#94a3b8" });
+    const previous = this.activeIds;
+    this.activeIds = activeStopIds;
+    for (const id of this.markers.keys()) {
+      if ((previous === null || previous.has(id)) !== (activeStopIds === null || activeStopIds.has(id))) {
+        this.styleStop(id);
       }
     }
   }
 
-  highlightStop(stopId: number): void {
-    // Reset all to default (dimming will be re-applied by caller)
-    for (const [, m] of this.markers) {
-      m.setStyle({ radius: 4, fillColor: "#60a5fa", weight: 1.5 });
-    }
-    const selected = this.markers.get(stopId);
-    if (selected) {
-      selected.setStyle({
-        radius: 7,
-        fillColor: "#e94560",
-        fillOpacity: 1,
-        weight: 3,
-      });
-      selected.bringToFront();
-    }
+  highlightStop(stopId: number | null): void {
+    const previous = this.selectedId;
+    this.selectedId = stopId;
+    if (previous !== null) this.styleStop(previous);
+    if (stopId !== null) this.styleStop(stopId);
+  }
+
+  private styleStop(id: number): void {
+    const marker = this.markers.get(id);
+    if (!marker) return;
+    const selected = id === this.selectedId;
+    const active = this.activeIds === null || this.activeIds.has(id);
+    marker.setStyle({
+      radius: selected ? 7 : active ? 4 : 3,
+      fillColor: selected ? "#e94560" : active ? "#60a5fa" : "#94a3b8",
+      fillOpacity: selected ? 1 : active ? 0.9 : 0.15,
+      weight: selected ? 3 : 1.2,
+    });
+    if (selected) marker.bringToFront();
   }
 }

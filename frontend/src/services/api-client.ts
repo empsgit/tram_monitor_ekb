@@ -26,14 +26,18 @@ export interface StopArrivals {
     route: string;
     route_id: number;
     eta_seconds: number | null;
+    eta_min_seconds?: number | null;
+    eta_max_seconds?: number | null;
+    eta_source?: "history" | "mixed" | "fallback";
     signal_lost: boolean;
   }>;
 }
 
 const BASE = "/api";
 
-async function fetchJson<T>(path: string): Promise<T> {
-  const resp = await fetch(`${BASE}${path}`);
+async function fetchJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const timeout = AbortSignal.timeout(10000);
+  const resp = await fetch(`${BASE}${path}`, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
   if (!resp.ok) throw new Error(`API error ${resp.status}: ${path}`);
   return resp.json();
 }
@@ -48,8 +52,9 @@ export async function getStops(): Promise<StopInfo[]> {
 
 export async function getStopArrivals(
   stopId: number,
-  route?: number
+  route?: number,
+  signal?: AbortSignal
 ): Promise<StopArrivals> {
   const params = route ? `?route=${route}` : "";
-  return fetchJson(`/stops/${stopId}/arrivals${params}`);
+  return fetchJson(`/stops/${stopId}/arrivals${params}`, signal);
 }

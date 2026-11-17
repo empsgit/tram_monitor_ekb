@@ -55,7 +55,9 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:?Generate .env before starting}@redis:6379/0
       ETTU_BASE_URL: https://map.ettu.ru
       POLL_INTERVAL_SECONDS: "10"
-      HISTORY_RECORDING_ENABLED: "false"
+      HISTORY_RECORDING_ENABLED: ${HISTORY_RECORDING_ENABLED:-false}
+      POSITION_RETENTION_DAYS: ${POSITION_RETENTION_DAYS:-30}
+      SAMPLE_RETENTION_DAYS: ${SAMPLE_RETENTION_DAYS:-180}
     depends_on:
       db:
         condition: service_healthy

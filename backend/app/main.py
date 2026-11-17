@@ -71,6 +71,8 @@ async def lifespan(app: FastAPI):
     if not loaded:
         logger.error("Could not load routes after 3 attempts - will keep retrying via scheduler")
 
+    await tracker.maintain_history()
+
     # Start scheduler
     scheduler = create_scheduler(tracker)
     scheduler.start()

@@ -14,6 +14,8 @@ from sqlalchemy import text
 from app.config import settings
 from app.core.broadcaster import Broadcaster
 from app.core.eta_calculator import EtaCalculator
+from app.core.history import History
+from app.core.journey_tracker import JourneyTracker, route_version
 from app.core.ettu_client import EttuClient, RawRoute, RawStop, RawVehicle
 from app.core.route_matcher import RouteMatcher
 from app.core.stop_detector import StopDetector, StopOnRoute
@@ -64,6 +66,10 @@ class VehicleTracker:
         self.route_matcher = RouteMatcher()
         self.stop_detector = StopDetector()
         self.eta_calculator = EtaCalculator()
+        self.journeys = JourneyTracker()
+        self.history = History(session_factory)
+        self._route_versions: dict[int, str] = {}
+        self._history_seen: dict[str, datetime.datetime] = {}
 
         # route_num -> route_id mapping
         self._route_num_to_id: dict[str, int] = {}
@@ -90,19 +96,6 @@ class VehicleTracker:
         # Current vehicle states (vehicle_id -> VehicleState)
         self.current_states: dict[str, VehicleState] = {}
 
-        # Per-vehicle smoothing state for progress and speed
-        self._smooth: dict[str, dict] = {}
-        # {vehicle_id: {"progress": float | None, "speed": float, "direction": int, "route_id": int}}
-
-        # Recent GPS positions for bearing calculation (last 3 points)
-        self._recent_positions: dict[str, list[tuple[float, float]]] = {}
-
-        # Per-vehicle stop passage tracking for travel time recording
-        # {vehicle_id: {"stop_id": int, "route_id": int, "time": datetime}}
-        self._last_stop_passage: dict[str, dict] = {}
-        # Batch of travel time observations to persist
-        self._travel_time_batch: list[dict] = []
-
         # Full next-stops list per vehicle (for station arrival queries)
         # vehicle_id -> [StopOnRoute] (all remaining stops, not just first 5)
         self._vehicle_all_next_stops: dict[str, list[StopOnRoute]] = {}
@@ -128,13 +121,41 @@ class VehicleTracker:
     ROUTES_CACHE_TTL = 86400  # 24 hours for routes
 
     async def load_routes_and_stops(self) -> None:
+        # Build off to the side. A failed fetch/transaction never mutates the live catalog.
+        staged = VehicleTracker(self.ettu, self.broadcaster, self.session_factory)
+        await staged._load_catalog()
+        fields = ("route_matcher", "stop_detector", "_route_num_to_id", "_route_id_to_num",
+                  "_route_geometries", "_route_stop_ids", "_route_stop_progress", "_stop_to_routes",
+                  "_stop_coords", "_stop_directions", "_diag_unresolved", "_diag_total_path_stops")
+        for name in fields:
+            setattr(self, name, getattr(staged, name))
+        self._route_versions = {rid: route_version(directions)
+                                for rid, directions in self.stop_detector._stops.items()}
+        for vid, journey in list(self.journeys.states.items()):
+            if self._route_versions.get(journey.route_id) != journey.version:
+                del self.journeys.states[vid]
+                self._vehicle_all_next_stops.pop(vid, None)
+                state = self.current_states.get(vid)
+                if state:
+                    state.next_stops = []
+                    state.prev_stop = None
+                    state.direction = None
+                    state.direction_status = "learning"
+        self._rebuild_stop_arrivals_snapshot()
+
+    async def _load_catalog(self) -> None:
         """Fetch and load routes and stops from ETTU API (or DB cache) into matchers."""
         routes = await self.ettu.fetch_routes()
+        if not routes:
+            raise RuntimeError('Empty route catalog; keeping previous snapshot')
 
         # Try cached stops from DB; only fetch from ETTU if stale (>7 days) or empty
         stops = await self._load_cached_stops()
-        if not stops:
+        stops_fetched = not stops
+        if stops_fetched:
             stops = await self.ettu.fetch_stops()
+        if not stops:
+            raise RuntimeError('Empty stop catalog; keeping previous snapshot')
 
         # Try cached OSM geometries first; fetch fresh if cache is stale (>24h)
         osm_geometries = await self._load_cached_geometries()
@@ -256,7 +277,7 @@ class VehicleTracker:
             await asyncio.sleep(0.3)
 
         # Save to database (only named stops)
-        await self._persist_routes_stops(routes, stops)
+        await self._persist_routes_stops(routes, stops, stops_fetched=stops_fetched)
         logger.info(
             "Loaded %d routes, %d total stops (%d with geometry)",
             len(routes), len(stops), len(self._route_geometries),
@@ -270,296 +291,90 @@ class VehicleTracker:
         """Get named stop IDs for a route."""
         return self._route_stop_ids.get(route_id, [])
 
-    # How long to keep a vehicle on the map after it disappears from API
-    GHOST_TTL_SECONDS = 120  # 2 minutes
+    # Retain lost arrivals for an operational day, not forever after a tram leaves service.
+    GHOST_TTL_SECONDS = 6 * 3600
 
     async def poll_vehicles(self) -> None:
-        """Single poll cycle: fetch positions, process, publish (including ghost vehicles)."""
         try:
-            raw_vehicles = await self.ettu.fetch_vehicles()
-
+            vehicles = await self.ettu.fetch_vehicles()
             now = datetime.datetime.now(datetime.timezone.utc)
-            current_ids: set[str] = set()
-            states = []
-
-            for rv in raw_vehicles:
-                # If vehicle was a ghost (signal_lost), clear stale position history
-                # so bearing isn't computed from old coordinates
-                prev_state = self.current_states.get(rv.dev_id)
-                if prev_state and prev_state.signal_lost:
-                    self._recent_positions.pop(rv.dev_id, None)
-
-                # Compute data age from ATIME for ETA correction
-                data_age_s = 0.0
-                if rv.atime_utc:
-                    data_age_s = max(0.0, (now - rv.atime_utc).total_seconds())
-                    # Clamp to reasonable range (clock skew / stale data)
-                    if data_age_s > 300:
-                        data_age_s = 0.0  # Ignore clearly wrong timestamps
-
-                state = self._process_vehicle(rv, data_age_s=data_age_s)
-                if state:
-                    state.signal_lost = False
-                    states.append(state)
-                    self.current_states[state.id] = state
-                    self._vehicle_data_age[state.id] = data_age_s
-                    # Use ATIME for last_seen if available (more accurate for ghost detection)
-                    self._last_seen[state.id] = rv.atime_utc or now
-                    current_ids.add(state.id)
-                    if settings.history_recording_enabled and rv.atime_utc:
-                        self._record_stop_passage(state, rv.atime_utc)
-
-            # Add ghost vehicles: recently seen but absent from current API response
-            expired = []
-            for vid, last_seen in self._last_seen.items():
-                if vid in current_ids:
-                    continue
-                age = (now - last_seen).total_seconds()
-                if age <= self.GHOST_TTL_SECONDS:
-                    ghost = self.current_states.get(vid)
-                    if ghost:
-                        ghost.signal_lost = True
-                        ghost.speed = 0
-                        states.append(ghost)
-                else:
-                    expired.append(vid)
+            for rv in vehicles:
+                try:
+                    state = self._process_vehicle(rv, now=now)
+                    if state:
+                        self.current_states[state.id] = state
+                except Exception:
+                    logger.exception("Invalid vehicle observation: %s", rv.dev_id)
+            for vid, state in list(self.current_states.items()):
+                last_seen = self._last_seen.get(vid)
+                age = (now - last_seen).total_seconds() if last_seen else float("inf")
+                if age > self.GHOST_TTL_SECONDS:
                     self.current_states.pop(vid, None)
-                    self._smooth.pop(vid, None)
-                    self._recent_positions.pop(vid, None)
+                    self._last_seen.pop(vid, None)
                     self._vehicle_all_next_stops.pop(vid, None)
-                    self._last_stop_passage.pop(vid, None)
                     self._vehicle_data_age.pop(vid, None)
-
-            for vid in expired:
-                del self._last_seen[vid]
-
-            # Rebuild per-stop arrivals snapshot in background (once per poll cycle).
+                    self.journeys.states.pop(vid, None)
+                    self._history_seen.pop(vid, None)
+                    continue
+                state.signal_lost = age > JourneyTracker.FRESH_SECONDS
+                self._vehicle_data_age[vid] = age
             self._rebuild_stop_arrivals_snapshot()
-
-            # Publish all vehicles (live + ghosts) to subscribers
-            vehicles_data = [s.model_dump() for s in states]
-            await self.broadcaster.publish(vehicles_data)
-
-            # Persist positions and travel times (only if we got data)
-            if raw_vehicles and settings.history_recording_enabled:
-                await self._persist_positions(raw_vehicles)
-                await self._persist_travel_times()
-
+            await self.broadcaster.publish([s.model_dump() for s in self.current_states.values()])
+            if settings.history_recording_enabled:
+                await self.history.flush()
         except Exception:
             logger.exception("Error in vehicle poll cycle")
 
-    def _process_vehicle(self, rv: RawVehicle, data_age_s: float = 0.0) -> VehicleState | None:
-        """Process a single raw vehicle through the pipeline.
-
-        Stop detection is GPS-based (independent of route geometry).
-        Route geometry is only used for visual snapping + animation progress.
-        data_age_s: seconds since ATIME — subtracted from ETAs.
-        """
+    def _process_vehicle(self, rv: RawVehicle, data_age_s: float = 0.0,
+                         now: datetime.datetime | None = None) -> VehicleState | None:
+        now = now or datetime.datetime.now(datetime.timezone.utc)
         route_id = self._route_num_to_id.get(rv.route_num)
-
+        directions = self.stop_detector._stops.get(route_id, {})
+        version = self._route_versions.get(route_id, "")
+        result = self.journeys.observe(rv.dev_id, route_id, version, directions,
+                                       rv.lat, rv.lon, rv.speed, rv.atime_utc, now)
+        self.history.counters[result.quality] += 1
+        journey = self.journeys.states.get(rv.dev_id)
+        if settings.history_recording_enabled:
+            position = None
+            if (rv.atime_utc and result.quality not in ("invalid_position", "future_time", "duplicate", "out_of_order")
+                    and self._history_seen.get(rv.dev_id) != rv.atime_utc):
+                position = dict(vehicle_id=rv.dev_id, route_id=route_id, route_version=version or None,
+                                direction=journey.direction if journey and result.accepted else None,
+                                observed_at=rv.atime_utc, received_at=now, lat=rv.lat, lon=rv.lon,
+                                speed=max(0, rv.speed), course=rv.course if math.isfinite(rv.course) else 0,
+                                quality=result.quality)
+                self._history_seen[rv.dev_id] = rv.atime_utc
+            self.history.enqueue(position, result.visits, result.segments)
+        previous = self.current_states.get(rv.dev_id)
+        if not result.accepted:
+            if previous:
+                return previous
+            if result.quality != "stale":
+                return None
+        if rv.atime_utc:
+            self._last_seen[rv.dev_id] = rv.atime_utc
         state = VehicleState(
-            id=rv.dev_id,
-            board_num=rv.board_num,
-            route=rv.route_num,
-            route_id=route_id,
-            lat=rv.lat,
-            lon=rv.lon,
-            speed=rv.speed,
-            course=rv.course,
-            timestamp=rv.timestamp,
+            id=rv.dev_id, board_num=rv.board_num, route=rv.route_num, route_id=route_id,
+            lat=rv.lat, lon=rv.lon, speed=max(0, rv.speed),
+            course=previous.course if previous and rv.speed == 0 else rv.course if math.isfinite(rv.course) else 0,
+            timestamp=rv.atime_utc.isoformat() if rv.atime_utc else None,
+            direction=journey.direction if journey else None,
+            direction_status=journey.quality if journey else "learning",
         )
-
-        if route_id is None:
-            return state
-
-        # Track recent positions for bearing calculation (keep last 5 for better averaging)
-        positions = self._recent_positions.get(rv.dev_id, [])
-        positions.append((rv.lat, rv.lon))
-        if len(positions) > 5:
-            positions = positions[-5:]
-        self._recent_positions[rv.dev_id] = positions
-
-        # Compute bearing from recent movement
-        # Only use movement bearing if the vehicle has actually moved significantly
-        movement_bearing = None
-        movement_dist_m = 0.0
-        if len(positions) >= 2:
-            p_old, p_new = positions[0], positions[-1]
-            dlat_m = (p_new[0] - p_old[0]) * LAT_M_PER_DEG
-            dlon_m = (p_new[1] - p_old[1]) * LON_M_PER_DEG
-            dist_m = math.sqrt(dlat_m * dlat_m + dlon_m * dlon_m)
-            movement_dist_m = dist_m
-            if dist_m > 30:  # Moved at least 30m — reliable bearing
-                movement_bearing = math.degrees(math.atan2(dlon_m, dlat_m)) % 360
-            elif rv.speed > 5:  # API reports moving but GPS jitter hides it
-                movement_bearing = rv.course
-        # If movement_bearing is None, detection relies on preferred_direction
-
-        # --- Disable smoothing: use raw instantaneous speed ---
-        prev = self._smooth.get(rv.dev_id)
-        smoothed_speed = rv.speed
-
-        # --- Stop detection with stateful direction ---
-        # Determine direction once, keep it, and switch only after terminal turn-around.
-        prev_direction = None
-        prev_terminal_dist_m = None
-        prev_terminal_min_dist_m = None
-        if prev and prev.get("route_id") == route_id:
-            prev_direction = prev.get("direction")
-            prev_terminal_dist_m = prev.get("terminal_distance_m")
-            prev_terminal_min_dist_m = prev.get("terminal_min_distance_m")
-
-        if prev_direction is None:
-            detection = self.stop_detector.detect(
-                route_id, rv.lat, rv.lon, movement_bearing,
-                max_next=200, preferred_direction=None,
-            )
-            direction = detection.direction
-        else:
-            direction = int(prev_direction)
-            detection = self.stop_detector.detect_in_direction(
-                route_id, direction, rv.lat, rv.lon, max_next=200
-            )
-
-        near_terminal = len(detection.next_stops) <= 1
-        terminal_distance_m = None
-        terminal_min_dist_m = None
-
-        if near_terminal:
-            dir_stops = self.stop_detector._stops.get(route_id, {}).get(direction, [])
-            if dir_stops:
-                terminal = dir_stops[-1]
-                terminal_distance_m = _haversine(rv.lat, rv.lon, terminal.lat, terminal.lon)
-                prev_min = float(prev_terminal_min_dist_m) if prev_terminal_min_dist_m is not None else terminal_distance_m
-                terminal_min_dist_m = min(prev_min, terminal_distance_m)
-
-                # Switch direction only when the vehicle was close to terminal and now moves away.
-                departed_terminal = (
-                    prev_terminal_dist_m is not None
-                    and float(prev_terminal_dist_m) < 180
-                    and terminal_distance_m > float(prev_terminal_dist_m) + 30
-                    and rv.speed > 3
-                )
-                if departed_terminal:
-                    available_dirs = list(self.stop_detector._stops.get(route_id, {}).keys())
-                    alt_dirs = [d for d in available_dirs if d != direction]
-                    if alt_dirs:
-                        direction = alt_dirs[0]
-                        detection = self.stop_detector.detect_in_direction(
-                            route_id, direction, rv.lat, rv.lon, max_next=200
-                        )
-                        near_terminal = len(detection.next_stops) <= 1
-                        terminal_distance_m = None
-                        terminal_min_dist_m = None
-
-        # Store full next stops for station arrival queries
-        self._vehicle_all_next_stops[rv.dev_id] = detection.next_stops
-
-        if detection.prev_stop:
-            state.prev_stop = StopInfo(
-                id=detection.prev_stop.stop_id,
-                name=detection.prev_stop.name,
-            )
-
-        # Show up to 5 next stops in vehicle state (for frontend display)
-        if detection.next_stops:
-            display_stops = detection.next_stops[:5]
-            etas = self.eta_calculator.calculate(
-                rv.lat, rv.lon, smoothed_speed, display_stops
-            )
-            age_correction = int(data_age_s)
-            state.next_stops = [
-                NextStopInfo(
-                    id=stop.stop_id,
-                    name=stop.name,
-                    eta_seconds=max(0, eta_s - age_correction) if eta_s is not None else None,
-                )
-                for stop, eta_s in etas
-            ]
-
-        # --- Route matching (progress tracking for diagnostics, NOT for frontend position) ---
-        # The frontend uses progress to position markers on route geometry via
-        # pointAtProgress(). Since OSM geometry is forward-only and projection can be
-        # wrong, we track progress internally but DON'T send it to the frontend.
-        # The frontend will use raw lat/lon from the API instead.
-        internal_progress = None
-        match = self.route_matcher.match(route_id, rv.lat, rv.lon, movement_bearing or rv.course)
-        if match:
-            raw_progress = match.progress
-
-            # Section-bound projection check from detected prev/next stops.
-            stop_prog = self._route_stop_progress.get(route_id, {})
-            sec_prev = detection.prev_stop.stop_id if detection.prev_stop else None
-            sec_next = detection.next_stops[0].stop_id if detection.next_stops else None
-            bounded_progress = raw_progress
-            if sec_prev is not None and sec_next is not None:
-                p0 = stop_prog.get(sec_prev)
-                p1 = stop_prog.get(sec_next)
-                if p0 is not None and p1 is not None:
-                    lo, hi = (p0, p1) if p0 <= p1 else (p1, p0)
-                    if raw_progress < lo - 0.01 or raw_progress > hi + 0.01:
-                        logger.warning(
-                            "Vehicle %s route %s: projection %.3f outside section [%s->%s]=[%.3f,%.3f]",
-                            rv.dev_id, route_id, raw_progress, sec_prev, sec_next, lo, hi,
-                        )
-                        self._log_projection_event("out_of_section", {
-                            "vehicle_id": rv.dev_id,
-                            "route_id": route_id,
-                            "raw_progress": round(raw_progress, 6),
-                            "section_prev_stop": sec_prev,
-                            "section_next_stop": sec_next,
-                            "section_lo": round(lo, 6),
-                            "section_hi": round(hi, 6),
-                        })
-                        bounded_progress = min(max(raw_progress, lo), hi)
-
-            # Enforce forward movement only when we actually observed movement.
-            prev_progress = prev.get("progress") if prev and prev.get("route_id") == route_id else None
-            enforce_forward = movement_dist_m > 20 or rv.speed > 5
-            if enforce_forward and prev_progress is not None:
-                if direction == 0 and bounded_progress + 0.001 < prev_progress:
-                    logger.debug(
-                        "Vehicle %s route %s: backward projection %.3f -> %.3f (dir=0)",
-                        rv.dev_id, route_id, prev_progress, bounded_progress,
-                    )
-                    self._log_projection_event("backward_projection", {
-                        "vehicle_id": rv.dev_id,
-                        "route_id": route_id,
-                        "direction": 0,
-                        "prev_progress": round(prev_progress, 6),
-                        "new_progress": round(bounded_progress, 6),
-                    })
-                    bounded_progress = prev_progress
-                elif direction == 1 and bounded_progress - 0.001 > prev_progress:
-                    logger.debug(
-                        "Vehicle %s route %s: backward projection %.3f -> %.3f (dir=1)",
-                        rv.dev_id, route_id, prev_progress, bounded_progress,
-                    )
-                    self._log_projection_event("backward_projection", {
-                        "vehicle_id": rv.dev_id,
-                        "route_id": route_id,
-                        "direction": 1,
-                        "prev_progress": round(prev_progress, 6),
-                        "new_progress": round(bounded_progress, 6),
-                    })
-                    bounded_progress = prev_progress
-
-            internal_progress = bounded_progress
-
-        # Don't send progress to frontend — it uses raw lat/lon from API
-        state.progress = None
-
-        self._smooth[rv.dev_id] = {
-            "progress": internal_progress,
-            "speed": smoothed_speed,
-            # Direction is stateful; switch only after terminal turn-around.
-            "direction": direction,
-            "route_id": route_id,
-            "terminal_distance_m": terminal_distance_m,
-            "terminal_min_distance_m": terminal_min_dist_m,
-        }
-
+        self._vehicle_all_next_stops[rv.dev_id] = self.journeys.next_stops(rv.dev_id, directions)
+        if journey and journey.direction in directions and journey.passed >= 0:
+            stop = directions[journey.direction][journey.passed]
+            state.prev_stop = StopInfo(id=stop.stop_id, name=stop.name)
+        # progress remains null: map positions are raw fixes, with no animation.
         return state
+
+    async def maintain_history(self) -> None:
+        try:
+            await self.history.retain(settings.position_retention_days, settings.sample_retention_days)
+            await self.history.refresh_stats()
+        except Exception:
+            logger.exception("History maintenance failed")
 
     async def _fetch_osrm_geometry(
         self, stops: list[dict]
@@ -736,215 +551,30 @@ out geom;
             logger.exception("Failed to load stops from database cache")
         return []
 
-    async def _update_cache_timestamp(self, cache_key: str) -> None:
-        """Update the cache freshness timestamp for a given key."""
-        try:
-            async with self.session_factory() as session:
-                now = datetime.datetime.now(datetime.timezone.utc)
-                await session.execute(
-                    text("""
-                        INSERT INTO data_cache_meta (cache_key, refreshed_at)
-                        VALUES (:key, :now)
-                        ON CONFLICT (cache_key) DO UPDATE SET refreshed_at = :now
-                    """),
-                    {"key": cache_key, "now": now},
-                )
-                await session.commit()
-        except Exception:
-            logger.exception("Failed to update cache timestamp for %s", cache_key)
-
-    # Ekaterinburg is UTC+5; skip travel time recording during night (no trams running)
-    _EKB_TZ = datetime.timezone(datetime.timedelta(hours=5))
-    _NIGHT_HOURS = range(1, 5)  # 00:00–04:59 local = no service
-    _DOW_KEYS = (
-        "monday",
-        "tuesday",
-        "wednesday",
-        "thursday",
-        "friday",
-        "saturday",
-        "sunday",
-    )
-
-    def _record_stop_passage(self, state: VehicleState, now: datetime.datetime) -> None:
-        """Track when a vehicle passes a stop; record travel time between consecutive stops."""
-        if not state.prev_stop or not state.route_id:
-            return
-
-        prev = self._last_stop_passage.get(state.id)
-        current_stop_id = state.prev_stop.id
-
-        if prev and prev["route_id"] == state.route_id:
-            # A repeated observation must not move the passage timestamp forward.
-            if now <= prev["time"] or prev["stop_id"] == current_stop_id:
-                return
-
-        if prev and prev["stop_id"] != current_stop_id and prev["route_id"] == state.route_id:
-            elapsed = (now - prev["time"]).total_seconds()
-            # Sanity: only record if 10s < elapsed < 60min (filters GPS glitches)
-            if 10 < elapsed < 3600:
-                local_now = now.astimezone(self._EKB_TZ)
-                local_hour = local_now.hour
-                # Skip night hours — no regular service, data would be unreliable
-                if local_hour in self._NIGHT_HOURS:
-                    pass
-                else:
-                    day_type = self._DOW_KEYS[local_now.weekday()]
-
-                    self._travel_time_batch.append({
-                        "route_id": state.route_id,
-                        "from_stop_id": prev["stop_id"],
-                        "to_stop_id": current_stop_id,
-                        "day_type": day_type,
-                        "hour": local_hour,
-                        "seconds": elapsed,
-                    })
-
-        self._last_stop_passage[state.id] = {
-            "stop_id": current_stop_id,
-            "route_id": state.route_id,
-            "time": now,
-        }
-
-    async def _persist_travel_times(self) -> None:
-        """Flush travel time observations to database with incremental averaging."""
-        if not self._travel_time_batch:
-            return
-        batch = self._travel_time_batch
-        self._travel_time_batch = []
-
-        try:
-            async with self.session_factory() as session:
-                now = datetime.datetime.now(datetime.timezone.utc)
-                for obs in batch:
-                    # Upsert: incrementally update median (running average) and sample count
-                    await session.execute(
-                        text("""
-                            INSERT INTO travel_time_segments
-                                (route_id, from_stop_id, to_stop_id, day_type, hour,
-                                 median_seconds, sample_count, updated_at)
-                            VALUES (:rid, :from_id, :to_id, :day_type, :hour,
-                                    :seconds, 1, :now)
-                            ON CONFLICT (route_id, from_stop_id, to_stop_id, day_type, hour)
-                            DO UPDATE SET
-                                median_seconds = travel_time_segments.median_seconds +
-                                    (:seconds - travel_time_segments.median_seconds) /
-                                    (travel_time_segments.sample_count + 1),
-                                sample_count = travel_time_segments.sample_count + 1,
-                                updated_at = :now
-                        """),
-                        {
-                            "rid": obs["route_id"],
-                            "from_id": obs["from_stop_id"],
-                            "to_id": obs["to_stop_id"],
-                            "day_type": obs["day_type"],
-                            "hour": obs["hour"],
-                            "seconds": obs["seconds"],
-                            "now": now,
-                        },
-                    )
-                await session.commit()
-                logger.debug("Persisted %d travel time observations", len(batch))
-        except Exception:
-            logger.exception("Failed to persist travel times")
-
-    async def _persist_positions(self, vehicles: list[RawVehicle]) -> None:
-        """Save vehicle positions to database."""
-        try:
-            async with self.session_factory() as session:
-                now = datetime.datetime.now(datetime.timezone.utc)
-                for rv in vehicles:
-                    route_id = self._route_num_to_id.get(rv.route_num)
-                    state = self.current_states.get(rv.dev_id)
-                    progress = state.progress if state else None
-
-                    await session.execute(
-                        text("""
-                            INSERT INTO vehicle_positions
-                                (vehicle_id, route_id, lat, lon, speed, course, progress, timestamp)
-                            VALUES (:vid, :rid, :lat, :lon, :speed, :course, :progress, :ts)
-                        """),
-                        {
-                            "vid": rv.dev_id,
-                            "rid": route_id,
-                            "lat": rv.lat,
-                            "lon": rv.lon,
-                            "speed": rv.speed,
-                            "course": rv.course,
-                            "progress": progress,
-                            "ts": now,
-                        },
-                    )
-                await session.commit()
-        except Exception:
-            logger.exception("Failed to persist vehicle positions")
-
-    async def _persist_routes_stops(
-        self, routes: list[RawRoute], stops: list[RawStop]
-    ) -> None:
-        """Upsert routes and stops to database (each in its own transaction)."""
-        # Phase 1a: persist routes
-        try:
-            async with self.session_factory() as session:
-                for r in routes:
-                    await session.execute(
-                        text("""
-                            INSERT INTO routes (id, number, name, color)
-                            VALUES (:id, :number, :name, :color)
-                            ON CONFLICT (id) DO UPDATE SET number=:number, name=:name
-                        """),
-                        {"id": r.id, "number": r.number, "name": r.name, "color": "#e53935"},
-                    )
-                await session.commit()
-        except Exception:
-            logger.exception("Failed to persist routes to database")
-
-        # Phase 1b: persist named stops + update cache timestamp
-        try:
-            async with self.session_factory() as session:
-                for s in stops:
-                    if not s.name:
-                        continue
-                    await session.execute(
-                        text("""
-                            INSERT INTO stops (id, name, direction, lat, lon)
-                            VALUES (:id, :name, :direction, :lat, :lon)
-                            ON CONFLICT (id) DO UPDATE SET name=:name, direction=:direction, lat=:lat, lon=:lon
-                        """),
-                        {"id": s.id, "name": s.name, "direction": s.direction, "lat": s.lat, "lon": s.lon},
-                    )
-                await session.commit()
-            await self._update_cache_timestamp("ettu_stops")
-        except Exception:
-            logger.exception("Failed to persist stops to database")
-
-        # Phase 2: persist route_stops (only for stops that are in DB)
-        if not stops:
-            return
-        try:
-            async with self.session_factory() as session:
-                named_stop_ids = {s.id for s in stops if s.name}
-                for r in routes:
-                    for s in r.stops:
-                        if s["id"] not in named_stop_ids:
-                            continue
-                        await session.execute(
-                            text("""
-                                INSERT INTO route_stops (route_id, stop_id, direction, "order")
-                                VALUES (:rid, :sid, :dir, :ord)
-                                ON CONFLICT ON CONSTRAINT uq_route_stop_dir_order
-                                DO NOTHING
-                            """),
-                            {
-                                "rid": r.id,
-                                "sid": s["id"],
-                                "dir": s["direction"],
-                                "ord": s["order"],
-                            },
-                        )
-                await session.commit()
-        except Exception:
-            logger.exception("Failed to persist route_stops to database")
+    async def _persist_routes_stops(self, routes: list[RawRoute], stops: list[RawStop],
+                                    stops_fetched: bool = False) -> None:
+        # Route sequences and cache freshness commit together; old associations disappear.
+        async with self.session_factory() as session:
+            await session.execute(text('''INSERT INTO routes (id, number, name, color)
+                VALUES (:id, :number, :name, '#e53935') ON CONFLICT (id)
+                DO UPDATE SET number=excluded.number, name=excluded.name'''),
+                [dict(id=r.id, number=r.number, name=r.name) for r in routes])
+            await session.execute(text('''INSERT INTO stops (id, name, direction, lat, lon)
+                VALUES (:id, :name, :direction, :lat, :lon) ON CONFLICT (id) DO UPDATE
+                SET name=excluded.name, direction=excluded.direction, lat=excluded.lat, lon=excluded.lon'''),
+                [dict(id=s.id, name=s.name, direction=s.direction or '', lat=s.lat, lon=s.lon) for s in stops])
+            await session.execute(text('DELETE FROM route_stops'))
+            links = [dict(rid=r.id, sid=s['id'], direction=s['direction'], order=s['order'])
+                     for r in routes for s in r.stops if s['name']]
+            if links:
+                await session.execute(text('''INSERT INTO route_stops (route_id, stop_id, direction, "order")
+                    VALUES (:rid, :sid, :direction, :order) ON CONFLICT DO NOTHING'''), links)
+            if stops_fetched:
+                await session.execute(text('''INSERT INTO data_cache_meta (cache_key, refreshed_at)
+                    VALUES ('ettu_stops', :now) ON CONFLICT (cache_key)
+                    DO UPDATE SET refreshed_at=excluded.refreshed_at'''),
+                    {'now': datetime.datetime.now(datetime.timezone.utc)})
+            await session.commit()
 
     def _log_projection_event(self, kind: str, payload: dict) -> None:
         event = {
@@ -1010,6 +640,20 @@ out geom;
 
         return {
             "total_stops_in_points_api": len(self._stop_coords),
+            "history": {
+                "enabled": settings.history_recording_enabled,
+                "counters": dict(self.history.counters),
+                "pending_positions": len(self.history.positions),
+                "pending_visits": len(self.history.visits),
+                "pending_segments": len(self.history.segments),
+                "statistics_groups": len(self.history.stats),
+                "statistics_updated_at": self.history.stats_updated_at,
+            },
+            "journeys": [{"vehicle_id": vid, "route_id": j.route_id,
+                          "route_version": j.version, "direction": j.direction,
+                          "status": j.quality, "passed_index": j.passed,
+                          "observed_at": j.observed_at.isoformat() if j.observed_at else None}
+                         for vid, j in self.journeys.states.items()],
             "total_routes": len(self._route_id_to_num),
             "total_vehicles": total_vehicles,
             "vehicles_matched_to_route": matched,
@@ -1018,112 +662,47 @@ out geom;
         }
 
     def _rebuild_stop_arrivals_snapshot(self) -> None:
-        """Recompute arrivals for all stops from current vehicle states."""
-        MAX_ETA_SECONDS = 5400  # 1.5 hours
-
         snapshot: dict[int, list[dict]] = {}
-
         for vid, state in self.current_states.items():
-            if not state.route_id:
+            journey = self.journeys.states.get(vid)
+            if not journey or journey.direction is None:
                 continue
-
-            next_stops = self._vehicle_all_next_stops.get(vid, [])
-            if not next_stops:
+            directions = self.stop_detector._stops.get(journey.route_id, {})
+            if journey.direction not in directions:
                 continue
-
-            eta_by_stop: dict[int, int | None] = {}
-            if not state.signal_lost:
-                calc = self.eta_calculator.calculate(
-                    state.lat, state.lon, state.speed, next_stops
-                )
-                age = int(self._vehicle_data_age.get(vid, 0))
-                for stop, eta in calc:
-                    if eta is not None:
-                        eta = max(0, eta - age)
-                        if eta > MAX_ETA_SECONDS:
-                            eta = None
-                    eta_by_stop[stop.stop_id] = eta
-
-            for ns in next_stops:
-                eta = None if state.signal_lost else eta_by_stop.get(ns.stop_id)
-                snapshot.setdefault(ns.stop_id, []).append({
-                    "vehicle_id": state.id,
-                    "board_num": state.board_num,
-                    "route": state.route,
-                    "route_id": state.route_id,
-                    "eta_seconds": round(eta) if eta is not None else None,
-                    "signal_lost": state.signal_lost,
-                })
-
-        # Deduplicate per stop and keep stable sort order.
-        for stop_id, items in snapshot.items():
-            by_vehicle: dict[str, dict] = {}
-            for item in items:
-                prev = by_vehicle.get(item["vehicle_id"])
-                if prev is None:
-                    by_vehicle[item["vehicle_id"]] = item
+            predictions = self.eta_calculator.predict(journey, directions[journey.direction], self.history)
+            age = self._vehicle_data_age.get(vid, 0)
+            correction = min(30, max(0, age)) if state.speed > 0 else 0
+            state.next_stops = []
+            seen = set()
+            for stop, estimate in predictions:
+                for key in ("eta_seconds", "eta_min_seconds", "eta_max_seconds"):
+                    value = estimate[key]
+                    estimate[key] = None if state.signal_lost else max(0, int(value - correction)) if value is not None else None
+                if stop.stop_id in seen:
                     continue
-
-                prev_sig = bool(prev.get("signal_lost"))
-                new_sig = bool(item.get("signal_lost"))
-                prev_eta = prev.get("eta_seconds")
-                new_eta = item.get("eta_seconds")
-
-                if prev_sig and not new_sig:
-                    by_vehicle[item["vehicle_id"]] = item
-                    continue
-                if prev_sig == new_sig:
-                    p = prev_eta if prev_eta is not None else 999999
-                    n = new_eta if new_eta is not None else 999999
-                    if n < p:
-                        by_vehicle[item["vehicle_id"]] = item
-
-            deduped = list(by_vehicle.values())
-            deduped.sort(
-                key=lambda a: (
-                    1 if a.get("signal_lost") else 0,
-                    a.get("eta_seconds") if a.get("eta_seconds") is not None else 999999,
-                )
-            )
-            snapshot[stop_id] = deduped[:30]
-
+                seen.add(stop.stop_id)
+                snapshot.setdefault(stop.stop_id, []).append(dict(
+                    vehicle_id=vid, board_num=state.board_num, route=state.route,
+                    route_id=state.route_id, signal_lost=state.signal_lost,
+                    source_age=age, countdown_budget=max(0, 30 - correction) if state.speed > 0 else 0,
+                    **estimate))
+                if len(state.next_stops) < 5:
+                    state.next_stops.append(NextStopInfo(id=stop.stop_id, name=stop.name, **estimate))
         self._stop_arrivals_snapshot = snapshot
         self._stop_arrivals_updated_monotonic = time.monotonic()
 
-    def get_vehicles_for_stop(
-        self, stop_id: int, route_filter: int | None = None
-    ) -> list[dict]:
-        """Return arrivals from background snapshot with ETA age compensation."""
-        base = self._stop_arrivals_snapshot.get(stop_id, [])
-        if not base:
-            return []
-
-        snapshot_age_s = 0
-        if self._stop_arrivals_updated_monotonic > 0:
-            snapshot_age_s = int(max(0.0, time.monotonic() - self._stop_arrivals_updated_monotonic))
-
-        arrivals: list[dict] = []
-        for item in base:
-            if route_filter and item.get("route_id") != route_filter:
+    def get_vehicles_for_stop(self, stop_id: int, route_filter: int | None = None) -> list[dict]:
+        age = max(0, time.monotonic() - self._stop_arrivals_updated_monotonic)
+        arrivals = []
+        for item in self._stop_arrivals_snapshot.get(stop_id, []):
+            if route_filter is not None and item['route_id'] != route_filter:
                 continue
-
-            eta = item.get("eta_seconds")
-            if eta is not None and not item.get("signal_lost"):
-                eta = max(0, int(eta) - snapshot_age_s)
-
-            arrivals.append({
-                "vehicle_id": item["vehicle_id"],
-                "board_num": item["board_num"],
-                "route": item["route"],
-                "route_id": item["route_id"],
-                "eta_seconds": eta,
-                "signal_lost": bool(item.get("signal_lost", False)),
-            })
-
-        arrivals.sort(
-            key=lambda a: (
-                1 if a.get("signal_lost") else 0,
-                a.get("eta_seconds") if a.get("eta_seconds") is not None else 999999,
-            )
-        )
+            row = {k: v for k, v in item.items() if k not in ('source_age', 'countdown_budget')}
+            row['signal_lost'] = item['signal_lost'] or item['source_age'] + age > JourneyTracker.FRESH_SECONDS
+            for key in ('eta_seconds', 'eta_min_seconds', 'eta_max_seconds'):
+                value = row[key]
+                row[key] = None if row['signal_lost'] else max(0, int(value - min(age, item['countdown_budget']))) if value is not None else None
+            arrivals.append(row)
+        arrivals.sort(key=lambda a: (a['signal_lost'], a['eta_seconds'] if a['eta_seconds'] is not None else 999999, a['vehicle_id']))
         return arrivals[:15]

@@ -3,7 +3,8 @@
 import type { VehicleData } from "./ws-client";
 import type { RouteInfo, StopInfo } from "./api-client";
 
-export type StateListener = () => void;
+export type StateChange = "vehicles" | "routes" | "stops" | "filter" | "selection" | "highlight" | "connection";
+export type StateListener = (change: StateChange) => void;
 
 export interface AppState {
   vehicles: Map<string, VehicleData>;
@@ -15,7 +16,7 @@ export interface AppState {
   connected: boolean;
 }
 
-class Store {
+export class Store {
   state: AppState = {
     vehicles: new Map(),
     routes: [],
@@ -33,13 +34,13 @@ class Store {
     return () => this.listeners.delete(listener);
   }
 
-  private notify(): void {
-    for (const l of this.listeners) l();
+  private notify(change: StateChange): void {
+    for (const l of this.listeners) l(change);
   }
 
   setConnected(connected: boolean): void {
     this.state.connected = connected;
-    this.notify();
+    this.notify("connection");
   }
 
   updateVehicles(vehicles: VehicleData[]): void {
@@ -48,18 +49,20 @@ class Store {
       fresh.set(v.id, v);
     }
     this.state.vehicles = fresh;
-    this.notify();
+    this.notify("vehicles");
   }
 
   setRoutes(routes: RouteInfo[]): void {
+    const firstLoad = this.state.routes.length === 0;
+    const previous = this.state.enabledRoutes;
     this.state.routes = routes;
-    this.state.enabledRoutes = new Set(routes.map((r) => r.number));
-    this.notify();
+    this.state.enabledRoutes = new Set(routes.filter((r) => firstLoad || previous.has(r.number)).map((r) => r.number));
+    this.notify("routes");
   }
 
   setStops(stops: StopInfo[]): void {
     this.state.stops = stops;
-    this.notify();
+    this.notify("stops");
   }
 
   toggleRoute(routeNum: string): void {
@@ -68,39 +71,37 @@ class Store {
     } else {
       this.state.enabledRoutes.add(routeNum);
     }
-    this.notify();
+    this.notify("filter");
   }
 
   enableAllRoutes(): void {
     this.state.enabledRoutes = new Set(this.state.routes.map((r) => r.number));
-    this.notify();
+    this.notify("filter");
   }
 
   disableAllRoutes(): void {
     this.state.enabledRoutes.clear();
-    this.notify();
+    this.notify("filter");
   }
 
   selectStop(stopId: number | null): void {
+    if (this.state.selectedStop === stopId) return;
     this.state.selectedStop = stopId;
-    if (stopId == null) {
-      this.state.highlightedVehicleIds = new Set();
-    }
-    this.notify();
+    this.state.highlightedVehicleIds = new Set();
+    this.notify("selection");
   }
 
   setHighlightedVehicles(vehicleIds: Iterable<string> | null): void {
     this.state.highlightedVehicleIds = vehicleIds
       ? new Set(vehicleIds)
       : new Set();
-    this.notify();
+    this.notify("highlight");
   }
 
   getVisibleVehicles(): VehicleData[] {
     const result: VehicleData[] = [];
-    const hasFilter = this.state.enabledRoutes.size > 0;
     for (const v of this.state.vehicles.values()) {
-      if (!hasFilter || this.state.enabledRoutes.has(v.route)) {
+      if (this.state.enabledRoutes.has(v.route)) {
         result.push(v);
       }
     }

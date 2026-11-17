@@ -10,6 +10,9 @@ class NextStopInfo(BaseModel):
     id: int
     name: str
     eta_seconds: int | None = None
+    eta_min_seconds: int | None = None
+    eta_max_seconds: int | None = None
+    eta_source: str = "fallback"
 
 
 class VehicleState(BaseModel):
@@ -26,6 +29,8 @@ class VehicleState(BaseModel):
     progress: float | None = None
     timestamp: str | None = None
     signal_lost: bool = False
+    direction: int | None = None
+    direction_status: str = "learning"
 
 
 class VehicleSnapshot(BaseModel):
@@ -44,6 +49,9 @@ class StopArrival(BaseModel):
     route: str
     route_id: int | None = None
     eta_seconds: int | None = None
+    eta_min_seconds: int | None = None
+    eta_max_seconds: int | None = None
+    eta_source: str = "fallback"
     distance_m: float | None = None
     signal_lost: bool = False
 

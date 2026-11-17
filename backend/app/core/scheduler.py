@@ -33,4 +33,8 @@ def create_scheduler(tracker) -> AsyncIOScheduler:
         max_instances=1,
     )
 
+    scheduler.add_job(
+        tracker.maintain_history, "interval", minutes=5,
+        id="maintain_history", name="Retain raw history and refresh quantiles", max_instances=1,
+    )
     return scheduler

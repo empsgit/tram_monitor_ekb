@@ -7,7 +7,8 @@ class Settings(BaseSettings):
     ettu_base_url: str = "https://map.ettu.ru"
     poll_interval_seconds: int = 10
     route_refresh_hours: int = 1
-    position_retention_days: int = 90
+    position_retention_days: int = 30
+    sample_retention_days: int = 180
     # Keep collection off until the new observation pipeline is validated.
     history_recording_enabled: bool = False
 

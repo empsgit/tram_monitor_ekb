@@ -20,7 +20,8 @@ async def list_stops(session: AsyncSession = Depends(get_session)):
     """Get all tram stops."""
     result = await session.execute(select(Stop).order_by(Stop.name))
     stops = result.scalars().all()
-    return [StopInfoFull(id=s.id, name=s.name, direction=s.direction, lat=s.lat, lon=s.lon) for s in stops]
+    return [StopInfoFull(id=s.id, name=s.name, direction=s.direction, lat=s.lat, lon=s.lon)
+            for s in stops if s.name and (not tracker or s.id in tracker._stop_to_routes)]
 
 
 @router.get("/{stop_id}/arrivals", response_model=StopArrivals)
@@ -33,7 +34,7 @@ async def get_arrivals(
     # Get stop info
     result = await session.execute(select(Stop).where(Stop.id == stop_id))
     stop = result.scalar_one_or_none()
-    if not stop:
+    if not stop or (tracker and stop_id not in tracker._stop_to_routes):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Stop not found")
 

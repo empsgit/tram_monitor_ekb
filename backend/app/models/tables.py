@@ -133,3 +133,57 @@ class DataCacheMeta(Base):
     refreshed_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class PositionObservation(Base):
+    """Versioned raw fixes; polling the same ATIME cannot create another row."""
+    __tablename__ = "position_observations"
+    __table_args__ = (UniqueConstraint("vehicle_id", "observed_at"),)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    vehicle_id: Mapped[str] = mapped_column(String(64))
+    route_id: Mapped[int | None] = mapped_column(Integer)
+    route_version: Mapped[str | None] = mapped_column(String(16))
+    direction: Mapped[int | None] = mapped_column(Integer)
+    observed_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), index=True)
+    received_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    lat: Mapped[float] = mapped_column(Float)
+    lon: Mapped[float] = mapped_column(Float)
+    speed: Mapped[float] = mapped_column(Float)
+    course: Mapped[float] = mapped_column(Float)
+    quality: Mapped[str] = mapped_column(String(32))
+
+
+class StopVisit(Base):
+    __tablename__ = "stop_visits"
+    __table_args__ = (UniqueConstraint("trip_id", "stop_index"),)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    trip_id: Mapped[str] = mapped_column(String(36))
+    vehicle_id: Mapped[str] = mapped_column(String(64))
+    route_id: Mapped[int] = mapped_column(Integer)
+    route_version: Mapped[str] = mapped_column(String(16))
+    direction: Mapped[int] = mapped_column(Integer)
+    stop_index: Mapped[int] = mapped_column(Integer)
+    stop_id: Mapped[int] = mapped_column(Integer)
+    arrived_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), index=True)
+    departed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    quality: Mapped[str] = mapped_column(String(32))
+
+
+class SegmentObservation(Base):
+    __tablename__ = "segment_observations"
+    __table_args__ = (UniqueConstraint("trip_id", "from_index", "to_index"),)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    trip_id: Mapped[str] = mapped_column(String(36))
+    vehicle_id: Mapped[str] = mapped_column(String(64))
+    route_id: Mapped[int] = mapped_column(Integer)
+    route_version: Mapped[str] = mapped_column(String(16))
+    direction: Mapped[int] = mapped_column(Integer)
+    from_index: Mapped[int] = mapped_column(Integer)
+    to_index: Mapped[int] = mapped_column(Integer)
+    from_stop_id: Mapped[int] = mapped_column(Integer)
+    to_stop_id: Mapped[int] = mapped_column(Integer)
+    departed_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    arrived_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), index=True)
+    seconds: Mapped[float] = mapped_column(Float)
+    weekday: Mapped[int] = mapped_column(Integer)
+    hour: Mapped[int] = mapped_column(Integer)

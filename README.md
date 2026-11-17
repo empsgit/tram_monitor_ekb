@@ -20,15 +20,12 @@ stored in the ignored `.env` file with mode 600. Do not reuse credentials or
 images from a compromised host. SSH private keys stay on the operator's machine.
 The ETTU key `111` is public; this deployment requires no private third-party API key.
 
-History recording is deliberately disabled in Compose and application defaults.
-Live tracking and arrivals still work. Neither positions nor segment statistics
-are written, and deployment never deletes existing history automatically.
-Keep recording disabled until source-time deduplication, direction validation,
-raw segment observations, retention, and correct quantiles are implemented and tested.
-The legacy `median_seconds` aggregation is not a true median and must not be used
-for predictions. The passage timer now preserves the original stop passage time
-and uses ATIME when the legacy collection path is explicitly enabled.
-
+History collection defaults to off. After validation, set
+`HISTORY_RECORDING_ENABLED=true` in the server's ignored `.env` and recreate
+only the backend (`docker compose up -d --no-deps backend`). New collection uses
+`position_observations`, `stop_visits`, and `segment_observations`. Legacy
+`vehicle_positions` and `travel_time_segments` are neither read nor written.
+See [history and ETA](docs/HISTORY.md) for quality rules, retention and verification.
 The health endpoint reports database and Redis connectivity and recording status.
 Container logs rotate at 10 MB with three files per service.
 
@@ -77,83 +74,39 @@ All forward-direction (direction=0) stop coordinates are sent as waypoints. OSRM
 
 **Fallback**: If OSRM fails, the route is drawn as straight lines between consecutive stop coordinates.
 
-### 3. Vehicle Processing Pipeline
+### 3. Observation-Time Processing
 
-Every 10 seconds, each raw vehicle goes through 3 stages:
+`JourneyTracker` uses ATIME, ordered stop sequences and observed movement,
+not the map polyline or API course, to confirm direction. It ignores repeated,
+out-of-order, future, stale and implausibly displaced fixes for journey advancement.
+A new vehicle needs observations near two distinct stops in forward order.
+Ambiguous directions stay unknown. Direction is locked until an observed terminal
+departure, a route version change, or a data gap that requires reacquisition.
 
-#### Stage 1: Route Matching (`route_matcher.py`)
+Arrival and departure observations are separate. Only adjacent confirmed visits
+with continuous source timestamps produce a segment sample. Missing stops and
+long gaps do not become invented travel times. All timing is approximate to the
+sampling interval; raw observations remain available for later recalculation.
 
-Uses **Shapely linear referencing** to snap each tram's GPS coordinate onto its route geometry:
+### 4. ETA and Stop Arrivals
 
-- Creates a `LineString` from the route's `[[lat, lon], ...]` geometry
-- Projects the vehicle's point onto the line → **progress** (0.0 to 1.0, position along the route)
-- Calculates perpendicular distance — must be within **300 meters** (`MAX_SNAP_DISTANCE_M`) or matching fails
-- **Direction inference**: compares vehicle's `course` (heading) with route bearing at that point. If they differ by >90°, the tram is traveling in reverse (direction=1)
+Real PostgreSQL quantiles are computed from raw segment and dwell observations,
+grouped by route version, direction, sequence index, local weekday and hour.
+Sparse groups fall back to hourly/all-time history, then a conservative distance
+estimate. Responses report `eta_source` and indicative lower/upper bounds.
 
-#### Stage 2: Stop Detection (`stop_detector.py`)
+All stop arrivals are rebuilt in memory each poll. Only confirmed upcoming stops
+are included. Repeated IDs in a loop use the nearest future occurrence. Route
+filtering happens before the result limit. Stale source data gets `signal_lost`
+and no ETA; stationary vehicles do not get a synthetic countdown.
 
-Given the vehicle's `distance_along` (progress × route length) and direction:
+### 5. Frontend
 
-- Stops are pre-sorted by `distance_along` per direction
-- **Binary search** (`bisect`) finds the vehicle's position among sorted stops
-- Returns the **previous stop** (last one passed) and **next 5 stops** ahead
-
-#### Stage 3: ETA Calculation (`eta_calculator.py`)
-
-For each upcoming stop:
-
-```
-remaining_m = stop.distance_along - vehicle.distance_along
-speed_ms   = max(vehicle_speed_kmh, 5.0) / 3.6
-eta_seconds = remaining_m / speed_ms
-```
-
-- Uses **minimum 5 km/h** to avoid division by zero when a tram is stopped
-- **Maximum ETA capped at 3600 seconds** (1 hour) — anything beyond is discarded
-
-### 4. Stop Arrivals (Остановка tab)
-
-When you search for a stop, `get_vehicles_for_stop()` uses **two tiers**:
-
-**Tier 1 — Pipeline-based**: Scans all tracked vehicles' `next_stops`. If any vehicle has the queried stop in its upcoming stops, returns that vehicle with the pre-calculated ETA.
-
-**Tier 2 — Distance-based fallback**: For routes that serve this stop but whose vehicles weren't matched by the pipeline:
-1. Looks up which routes serve this stop (from `_stop_to_routes` mapping)
-2. For each active vehicle on those routes, calculates **haversine distance** to the stop
-3. Estimates ETA as `distance_m / (max(speed, 5.0) / 3.6)`
-4. Discards if ETA > 1 hour
-
-### 5. Data Flow Summary
-
-```
-ETTU API (every 10s)
-    │
-    ▼
-EttuClient.fetch_vehicles()
-    │
-    ▼
-VehicleTracker._process_vehicle()  ×N vehicles
-    │
-    ├── RouteMatcher.match()       → progress (0.0–1.0), direction (0 or 1)
-    ├── StopDetector.detect()      → prev_stop, next 5 stops
-    └── EtaCalculator.calculate()  → ETAs per stop
-    │
-    ▼
-VehicleState
-    │
-    ├── Broadcaster → Redis pub/sub → WebSocket → Browser
-    ├── REST API /api/vehicles
-    └── Database (vehicle_positions table)
-```
-
-### 6. Frontend Rendering
-
-- **Route polylines**: Drawn from OSRM geometry, colored with Kelly's 24-color maximally distinct palette
-- **Tram markers**: Positioned with `leaflet.marker.slideto` for smooth animation between 10s polling intervals
-- **Trails**: Last 20 positions per tram, drawn as semi-transparent polylines (opacity 0.25)
-- **Stop markers**: CircleMarkers with direction in tooltip. Stops not on selected routes get dimmed
-- **ETAs**: Displayed as minutes in vehicle list and popups, showing next 3 stops
-
+Markers show received GPS fixes without interpolation or extrapolation.
+Stop requests use cancellation and a generation guard, with a small response
+cache and background refresh. Old requests cannot overwrite a newly selected
+stop. Filter/selection events no longer rebuild every map layer and hidden list.
+Disabling all routes hides all vehicles. Clearing selection restores stop styling.
 ## API Endpoints
 
 | Method | Path | Description |
@@ -212,7 +165,7 @@ Use this to identify:
 docker compose up -d --build
 ```
 
-The app will be available at `http://localhost` (nginx on port 80).
+The app will be available at `http://localhost:3000`.
 
 To rebuild after code changes:
 ```bash
@@ -225,8 +178,8 @@ Environment variables (set in `docker-compose.yml`):
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://tram:tram_secret@db:5432/tram_monitor` | PostgreSQL connection |
-| `REDIS_URL` | `redis://redis:6379/0` | Redis connection |
+| `DATABASE_URL` | Generated by Compose from `.env` | PostgreSQL connection |
+| `REDIS_URL` | Generated by Compose from `.env` | Redis connection |
 | `ETTU_BASE_URL` | `https://map.ettu.ru` | ETTU API base URL |
 | `POLL_INTERVAL_SECONDS` | `10` | Vehicle polling interval |
-| `ROUTE_REFRESH_HOURS` | `6` | Route/stop refresh interval |
+| `ROUTE_REFRESH_HOURS` | `1` | Route/stop refresh interval |
