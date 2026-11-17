@@ -2,6 +2,36 @@
 
 Real-time tram tracking application for Yekaterinburg, Russia. Shows live tram positions, routes, stops, and estimated arrival times on an interactive map.
 
+## Recovery Deployment
+
+On a clean Linux host with Docker Engine and the Compose plugin installed:
+
+```sh
+git clone https://github.com/empsgit/tram_monitor_ekb.git /opt/tram_monitor_ekb
+cd /opt/tram_monitor_ekb
+sh scripts/init-env.sh
+docker compose up -d --build
+curl --fail http://127.0.0.1:3000/api/health
+```
+
+Only the frontend port 3000 is published. PostgreSQL, Redis, and the backend
+are reachable only through the Docker network. Fresh random credentials are
+stored in the ignored `.env` file with mode 600. Do not reuse credentials or
+images from a compromised host. SSH private keys stay on the operator's machine.
+The ETTU key `111` is public; this deployment requires no private third-party API key.
+
+History recording is deliberately disabled in Compose and application defaults.
+Live tracking and arrivals still work. Neither positions nor segment statistics
+are written, and deployment never deletes existing history automatically.
+Keep recording disabled until source-time deduplication, direction validation,
+raw segment observations, retention, and correct quantiles are implemented and tested.
+The legacy `median_seconds` aggregation is not a true median and must not be used
+for predictions. The passage timer now preserves the original stop passage time
+and uses ATIME when the legacy collection path is explicitly enabled.
+
+The health endpoint reports database and Redis connectivity and recording status.
+Container logs rotate at 10 MB with three files per service.
+
 ## Architecture
 
 ```

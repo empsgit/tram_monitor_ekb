@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from sqlalchemy import text
 
@@ -14,6 +15,7 @@ from app.core.broadcaster import Broadcaster
 from app.core.ettu_client import EttuClient
 from app.core.scheduler import create_scheduler
 from app.core.vehicle_tracker import VehicleTracker
+from app.config import settings
 from app.db.session import async_session, engine
 from app.models.base import Base
 from app.models import tables  # noqa: F401
@@ -106,4 +108,20 @@ app.include_router(ws.router)
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    redis_ok = bool(ws.broadcaster and await ws.broadcaster.is_healthy())
+    try:
+        async with async_session() as session:
+            await asyncio.wait_for(session.execute(text("SELECT 1")), timeout=2)
+        database_ok = True
+    except Exception:
+        database_ok = False
+    healthy = redis_ok and database_ok
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={
+            "status": "ok" if healthy else "degraded",
+            "redis": redis_ok,
+            "database": database_ok,
+            "history_recording_enabled": settings.history_recording_enabled,
+        },
+    )

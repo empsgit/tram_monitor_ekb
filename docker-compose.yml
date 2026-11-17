@@ -1,12 +1,21 @@
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   db:
+    <<: *service-defaults
     image: postgis/postgis:16-3.4
     environment:
       POSTGRES_DB: tram_monitor
       POSTGRES_USER: tram
-      POSTGRES_PASSWORD: tram_secret
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate .env before starting}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -16,33 +25,45 @@ services:
       retries: 5
 
   redis:
+    <<: *service-defaults
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    user: redis
+    read_only: true
+    tmpfs:
+      - /data:rw,noexec,nosuid,size=1m,mode=1777
+    cap_drop:
+      - ALL
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Generate .env before starting}
+    command:
+      - /bin/sh
+      - -ec
+      - exec redis-server --save '' --appendonly no --maxmemory 64mb --maxmemory-policy allkeys-lru --requirepass "$$REDIS_PASSWORD"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -qx PONG"]
       interval: 5s
       timeout: 3s
       retries: 5
 
   backend:
+    <<: *service-defaults
     build: ./backend
-    ports:
-      - "8000:8000"
+    cap_drop:
+      - ALL
     environment:
-      DATABASE_URL: postgresql+asyncpg://tram:tram_secret@db:5432/tram_monitor
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://tram:${POSTGRES_PASSWORD:?Generate .env before starting}@db:5432/tram_monitor
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Generate .env before starting}@redis:6379/0
       ETTU_BASE_URL: https://map.ettu.ru
       POLL_INTERVAL_SECONDS: "10"
+      HISTORY_RECORDING_ENABLED: "false"
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend:/app
 
   frontend:
+    <<: *service-defaults
     build: ./frontend
     ports:
       - "3000:80"

@@ -11,6 +11,7 @@ from collections import deque
 import httpx
 from sqlalchemy import text
 
+from app.config import settings
 from app.core.broadcaster import Broadcaster
 from app.core.eta_calculator import EtaCalculator
 from app.core.ettu_client import EttuClient, RawRoute, RawStop, RawVehicle
@@ -305,7 +306,8 @@ class VehicleTracker:
                     # Use ATIME for last_seen if available (more accurate for ghost detection)
                     self._last_seen[state.id] = rv.atime_utc or now
                     current_ids.add(state.id)
-                    self._record_stop_passage(state, now)
+                    if settings.history_recording_enabled and rv.atime_utc:
+                        self._record_stop_passage(state, rv.atime_utc)
 
             # Add ghost vehicles: recently seen but absent from current API response
             expired = []
@@ -325,6 +327,8 @@ class VehicleTracker:
                     self._smooth.pop(vid, None)
                     self._recent_positions.pop(vid, None)
                     self._vehicle_all_next_stops.pop(vid, None)
+                    self._last_stop_passage.pop(vid, None)
+                    self._vehicle_data_age.pop(vid, None)
 
             for vid in expired:
                 del self._last_seen[vid]
@@ -337,7 +341,7 @@ class VehicleTracker:
             await self.broadcaster.publish(vehicles_data)
 
             # Persist positions and travel times (only if we got data)
-            if raw_vehicles:
+            if raw_vehicles and settings.history_recording_enabled:
                 await self._persist_positions(raw_vehicles)
                 await self._persist_travel_times()
 
@@ -769,6 +773,11 @@ out geom;
 
         prev = self._last_stop_passage.get(state.id)
         current_stop_id = state.prev_stop.id
+
+        if prev and prev["route_id"] == state.route_id:
+            # A repeated observation must not move the passage timestamp forward.
+            if now <= prev["time"] or prev["stop_id"] == current_stop_id:
+                return
 
         if prev and prev["stop_id"] != current_stop_id and prev["route_id"] == state.route_id:
             elapsed = (now - prev["time"]).total_seconds()
