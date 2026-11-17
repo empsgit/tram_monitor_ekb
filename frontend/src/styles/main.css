@@ -38,8 +38,6 @@ html, body {
   z-index: 1;
 }
 
-.leaflet-control-attribution { font-size: 10px !important; }
-
 /* === Status Bar === */
 .status-bar {
   position: fixed;
@@ -93,10 +91,24 @@ html, body {
   border-bottom: 1px solid var(--border);
 }
 
+.panel-title-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-bottom: 12px;
+}
+
 .panel-title {
   font-size: 18px;
   font-weight: 700;
-  margin-bottom: 12px;
+}
+
+.map-attribution {
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
 }
 
 .panel-tabs {

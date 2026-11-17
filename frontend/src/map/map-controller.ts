@@ -16,9 +16,6 @@ export function initMap(): L.Map {
     attributionControl: false,
   });
 
-  // Keep attribution visible above the mobile bottom panel.
-  L.control.attribution({ position: "topright" }).addTo(map);
-
   L.tileLayer(
     "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     {
