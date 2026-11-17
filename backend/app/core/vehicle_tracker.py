@@ -522,7 +522,8 @@ out geom;
             async with self.session_factory() as session:
                 # Check cache freshness
                 meta = await session.execute(
-                    text("SELECT refreshed_at FROM data_cache_meta WHERE cache_key = 'ettu_stops'")
+                    # v1 stored named stops only; v2 also retains geometry waypoints.
+                    text("SELECT refreshed_at FROM data_cache_meta WHERE cache_key = 'ettu_stops_v2'")
                 )
                 row = meta.first()
                 if row:
@@ -571,7 +572,7 @@ out geom;
                     VALUES (:rid, :sid, :direction, :order) ON CONFLICT DO NOTHING'''), links)
             if stops_fetched:
                 await session.execute(text('''INSERT INTO data_cache_meta (cache_key, refreshed_at)
-                    VALUES ('ettu_stops', :now) ON CONFLICT (cache_key)
+                    VALUES ('ettu_stops_v2', :now) ON CONFLICT (cache_key)
                     DO UPDATE SET refreshed_at=excluded.refreshed_at'''),
                     {'now': datetime.datetime.now(datetime.timezone.utc)})
             await session.commit()

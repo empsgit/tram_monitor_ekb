@@ -51,16 +51,20 @@ async def main():
         assert (await session.execute(text("SELECT count(*) FROM segment_observations"))).scalar() == 5
         assert (await session.execute(text("SELECT count(*) FROM stop_visits WHERE departed_at IS NOT NULL"))).scalar() == 1
     tracker = VehicleTracker(None, None, sessions)
+    async with sessions() as session:
+        await session.execute(text("INSERT INTO data_cache_meta VALUES ('ettu_stops', now()) ON CONFLICT DO NOTHING"))
+        await session.commit()
+    assert await tracker._load_cached_stops() == []
     stops = [RawStop(id=i, name=f"Stop {i}", lat=56.84, lon=60.6) for i in (1, 2, 3)]
     route = RawRoute(id=1, number="1", name="Test")
     route.stops = [dict(id=i, name=f"Stop {i}", direction=0, order=i) for i in (1, 2)]
     await tracker._persist_routes_stops([route], stops, stops_fetched=True)
     async with sessions() as session:
-        refreshed = (await session.execute(text("SELECT refreshed_at FROM data_cache_meta"))).scalar()
+        refreshed = (await session.execute(text("SELECT refreshed_at FROM data_cache_meta WHERE cache_key='ettu_stops_v2'"))).scalar()
     route.stops = [dict(id=i, name=f"Stop {i}", direction=0, order=i) for i in (1, 3)]
     await tracker._persist_routes_stops([route], stops, stops_fetched=False)
     async with sessions() as session:
-        assert (await session.execute(text("SELECT refreshed_at FROM data_cache_meta"))).scalar() == refreshed
+        assert (await session.execute(text("SELECT refreshed_at FROM data_cache_meta WHERE cache_key='ettu_stops_v2'"))).scalar() == refreshed
         assert list((await session.execute(text("SELECT stop_id FROM route_stops ORDER BY stop_id"))).scalars()) == [1, 3]
     route.stops.append(dict(id=9999, name="Missing", direction=0, order=4))
     try:

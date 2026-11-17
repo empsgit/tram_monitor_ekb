@@ -105,18 +105,29 @@ async function main() {
   wsClient.connect();
 
   // Fetch independently and concurrently; start live updates without waiting on REST.
-  await Promise.allSettled([
-    getRoutes().then((routes) => {
+  const loadRoutes = async () => {
+    try {
+      const routes = await getRoutes();
       routeLayer.loadRoutes(routes);
       vehicleLayer.loadRoutes(routes);
       store.setRoutes(routes);
       renderRouteFilter(routeFilterEl, routes);
-    }).catch((e) => console.error("Failed to load routes:", e)),
-    getStops().then((stops) => {
+    } catch (e) {
+      console.error("Failed to load routes, retrying:", e);
+      window.setTimeout(() => void loadRoutes(), 5000);
+    }
+  };
+  const loadStops = async () => {
+    try {
+      const stops = await getStops();
       stopLayer.loadStops(stops);
       store.setStops(stops);
-    }).catch((e) => console.error("Failed to load stops:", e)),
-  ]);
+    } catch (e) {
+      console.error("Failed to load stops, retrying:", e);
+      window.setTimeout(() => void loadStops(), 5000);
+    }
+  };
+  await Promise.all([loadRoutes(), loadStops()]);
 }
 
 main().catch(console.error);
