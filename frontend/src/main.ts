@@ -1,5 +1,8 @@
 /** Main entry point: initialize map, connect WebSocket, wire up UI. */
 
+import "leaflet/dist/leaflet.css";
+import "./styles/main.css";
+
 import { initMap } from "./map/map-controller";
 import { VehicleLayer } from "./map/vehicle-layer";
 import { StopLayer } from "./map/stop-layer";

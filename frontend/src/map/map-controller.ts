@@ -16,13 +16,14 @@ export function initMap(): L.Map {
     attributionControl: false,
   });
 
-  // Light-themed tiles (CartoDB Positron)
+  // Keep attribution visible above the mobile bottom panel.
+  L.control.attribution({ position: "topright" }).addTo(map);
+
   L.tileLayer(
-    "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+    "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     {
       attribution:
-        '',
-      subdomains: "abcd",
+        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       maxZoom: 19,
     }
   ).addTo(map);
