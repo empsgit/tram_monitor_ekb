@@ -102,6 +102,14 @@ and no ETA; stationary vehicles do not get a synthetic countdown.
 
 ### 5. Frontend
 
+The background uses the free, keyless OpenFreeMap Positron style with only streets,
+Russian street labels and water. Buildings, POIs and district labels are omitted.
+MapLibre renders this background inside Leaflet's tile pane; tram, stop and route
+overlays are unchanged. The renderer is lazy-loaded, uses one worker, and caps
+pixel ratio/tile cache size for mobile devices. If loading or WebGL initialization
+fails, standard OSM raster tiles are an automatic fallback (no layer switcher).
+Attribution remains in the sidebar. See https://openfreemap.org/quick_start/.
+
 Markers show received GPS fixes without interpolation or extrapolation.
 Stop requests use cancellation and a generation guard, with a small response
 cache and background refresh. Old requests cannot overwrite a newly selected

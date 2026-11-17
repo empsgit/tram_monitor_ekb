@@ -36,7 +36,10 @@ html, body {
   flex: 1;
   height: 100%;
   z-index: 1;
+  background: #f4f4f2;
 }
+
+.leaflet-gl-layer { pointer-events: none; }
 
 /* === Status Bar === */
 .status-bar {
@@ -110,6 +113,8 @@ html, body {
   font-size: 10px;
   white-space: nowrap;
 }
+
+.map-attribution a { color: inherit; }
 
 .panel-tabs {
   display: flex;
